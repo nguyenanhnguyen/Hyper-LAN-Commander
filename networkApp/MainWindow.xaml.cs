@@ -9,18 +9,18 @@ namespace networkApp
         public MainWindow()
         {
             InitializeComponent();
-
-            // Lấy IP hiển thị ngay
             txtIP.Text = _network.GetLocalIP();
 
-            // Đăng ký sự kiện khi tìm thấy thiết bị
+            // BẮT ĐẦU LẮNG NGHE NGAY KHI MỞ APP
+            _network.StartListeningForDiscovery();
+
             _network.OnDeviceFound += (ipFound) =>
             {
                 Dispatcher.Invoke(() => {
                     if (!lstDevices.Items.Contains(ipFound))
                     {
                         lstDevices.Items.Add(ipFound);
-                        txtStatus.Text = "Trạng thái: Đã tìm thấy máy mới!";
+                        txtStatus.Text = $"Đã thấy: {ipFound}";
                     }
                 });
             };
