@@ -29,6 +29,10 @@
                     <TextBlock Text="IP của bạn:" FontSize="12" Foreground="#5F6368"/>
                     <TextBlock x:Name="txtIP" Text="..." FontSize="22" FontWeight="ExtraBold"
                                Foreground="#202124" HorizontalAlignment="Center" Margin="0,4"/>
+                    <TextBlock x:Name="txtFingerprint" Text="" FontSize="11"
+                               Foreground="#5F6368" HorizontalAlignment="Center"
+                               FontFamily="Consolas"
+                               ToolTip="Danh tính mật mã của máy này — không thể giả mạo. Đọc cho bạn bè để họ đối chiếu."/>
                     <TextBlock x:Name="txtStatus" Text="Trạng thái: Sẵn sàng" FontSize="11"
                                Foreground="#34A853" HorizontalAlignment="Center" TextWrapping="Wrap"/>
                 </StackPanel>
@@ -81,16 +85,30 @@
                     </ListBox.ItemTemplate>
                 </ListBox>
 
-                <Grid Grid.Row="2" Margin="0,8,0,0">
+                <StackPanel Grid.Row="2" Margin="0,8,0,0">
+                    <!-- Progress truyền file — ẩn khi không có gì chạy -->
+                    <Grid x:Name="pnlProgress" Visibility="Collapsed" Margin="0,0,0,8">
+                        <ProgressBar x:Name="barTransfer" Height="20" Minimum="0" Maximum="100"/>
+                        <TextBlock x:Name="txtTransfer" HorizontalAlignment="Center"
+                                   VerticalAlignment="Center" FontSize="11"/>
+                    </Grid>
+
+                    <Grid>
                     <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="44"/>
+                        <ColumnDefinition Width="8"/>
                         <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="8"/>
                         <ColumnDefinition Width="90"/>
                     </Grid.ColumnDefinitions>
-                    <TextBox Grid.Column="0" x:Name="txtInput" Height="38" FontSize="14"
+                    <Button Grid.Column="0" x:Name="btnFile" Content="📎" Height="38" FontSize="16"
+                            Background="#F0F2F5" BorderBrush="#DADCE0"
+                            ToolTip="Gửi file (bên kia sẽ được hỏi trước khi nhận)"
+                            Click="btnFile_Click"/>
+                    <TextBox Grid.Column="2" x:Name="txtInput" Height="38" FontSize="14"
                              VerticalContentAlignment="Center" Padding="8,0"
                              KeyDown="txtInput_KeyDown"/>
-                    <Button Grid.Column="2" x:Name="btnSend" Content="Gửi" Height="38"
+                    <Button Grid.Column="4" x:Name="btnSend" Content="Gửi" Height="38"
                             Background="#34A853" Foreground="White" FontWeight="Bold"
                             Click="btnSend_Click">
                         <Button.Resources>
@@ -99,7 +117,8 @@
                             </Style>
                         </Button.Resources>
                     </Button>
-                </Grid>
+                    </Grid>
+                </StackPanel>
             </Grid>
         </Border>
     </Grid>

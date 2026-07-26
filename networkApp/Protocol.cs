@@ -13,12 +13,16 @@ namespace networkApp
     /// </summary>
     public enum PacketType : byte
     {
-        Text      = 0x01,
-        // Dự phòng cho các tuần sau:
-        FileMeta  = 0x10,
-        FileChunk = 0x11,
-        FileAck   = 0x12,
-        Resume    = 0x13,
+        Text         = 0x01,
+        Handshake    = 0x02, // trao public key + salt — gói DUY NHẤT không mã hóa
+
+        // Luồng file CONSENT-FIRST: không byte dữ liệu nào được gửi
+        // trước khi bên nhận chủ động Accept.
+        FileOffer    = 0x10, // "Tôi muốn gửi file X, size Y" (JSON)
+        FileAccept   = 0x11, // "Đồng ý, gửi từ offset Z"  ← Z>0 = RESUME
+        FileReject   = 0x12, // "Từ chối"
+        FileChunk    = 0x13, // [16B transferId][dữ liệu]
+        FileComplete = 0x14, // "Hết file"
     }
 
     /// <summary>
