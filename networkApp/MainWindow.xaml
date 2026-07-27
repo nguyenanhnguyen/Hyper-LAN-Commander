@@ -18,34 +18,44 @@
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="*"/>
                 <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
 
-            <TextBlock Grid.Row="0" Text="HYPER-LAN" FontSize="20" FontWeight="Bold"
-                       Foreground="#1A73E8" HorizontalAlignment="Center"/>
+            <Grid Grid.Row="0">
+                <TextBlock Text="HYPER-LAN" FontSize="20" FontWeight="Bold"
+                           Foreground="#1A73E8" HorizontalAlignment="Center"/>
+                <Button x:Name="btnLang" Content="{DynamicResource L_LangToggle}"
+                        Width="36" Height="24" FontSize="11" FontWeight="Bold"
+                        HorizontalAlignment="Right" VerticalAlignment="Center"
+                        Background="#F0F2F5" BorderBrush="#DADCE0" Foreground="#5F6368"
+                        Click="btnLang_Click"/>
+            </Grid>
 
             <Border Grid.Row="1" Background="White" CornerRadius="12" Padding="14" Margin="0,12,0,0"
                     BorderBrush="#DADCE0" BorderThickness="1">
                 <StackPanel>
-                    <TextBlock Text="IP của bạn:" FontSize="12" Foreground="#5F6368"/>
+                    <TextBlock Text="{DynamicResource L_YourIP}" FontSize="12" Foreground="#5F6368"/>
                     <TextBlock x:Name="txtIP" Text="..." FontSize="22" FontWeight="ExtraBold"
                                Foreground="#202124" HorizontalAlignment="Center" Margin="0,4"/>
                     <TextBlock x:Name="txtFingerprint" Text="" FontSize="11"
                                Foreground="#5F6368" HorizontalAlignment="Center"
                                FontFamily="Consolas"
-                               ToolTip="Danh tính mật mã của máy này — không thể giả mạo. Đọc cho bạn bè để họ đối chiếu."/>
-                    <TextBlock x:Name="txtStatus" Text="Trạng thái: Sẵn sàng" FontSize="11"
-                               Foreground="#34A853" HorizontalAlignment="Center" TextWrapping="Wrap"/>
+                               ToolTip="{DynamicResource L_FpTooltip}"/>
+                    <TextBlock x:Name="txtStatus" Text="{DynamicResource L_StatusReady}"
+                               FontSize="11" Foreground="#34A853" HorizontalAlignment="Center"
+                               TextWrapping="Wrap" Margin="0,4,0,0"/>
                 </StackPanel>
             </Border>
 
-            <TextBlock Grid.Row="2" Text="Thiết bị trong mạng:" Margin="0,14,0,4" FontWeight="Bold"/>
+            <TextBlock Grid.Row="2" Text="{DynamicResource L_Devices}"
+                       Margin="0,14,0,4" FontWeight="Bold"/>
 
-            <!-- Chọn 1 thiết bị ở đây = chọn người để chat bên phải -->
             <ListBox Grid.Row="3" x:Name="lstDevices"
                      SelectionChanged="lstDevices_SelectionChanged"
                      BorderBrush="#DADCE0"/>
 
-            <Button Grid.Row="4" x:Name="btnScan" Content="QUÉT MẠNG" Height="42" Margin="0,10,0,0"
+            <Button Grid.Row="4" x:Name="btnScan" Content="{DynamicResource L_Scan}"
+                    Height="42" Margin="0,10,0,0"
                     Background="#1A73E8" Foreground="White" FontWeight="Bold" FontSize="14"
                     Click="btnScan_Click">
                 <Button.Resources>
@@ -54,6 +64,22 @@
                     </Style>
                 </Button.Resources>
             </Button>
+
+            <!-- Kết nối thủ công: nhập IP:port (hoặc chỉ port cho loopback test) -->
+            <Grid Grid.Row="5" Margin="0,8,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="6"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBox Grid.Column="0" x:Name="txtManual" Height="32" FontSize="12"
+                         VerticalContentAlignment="Center" Padding="6,0"
+                         ToolTip="{DynamicResource L_ManualTooltip}"/>
+                <Button Grid.Column="2" x:Name="btnConnect" Content="{DynamicResource L_Connect}"
+                        Height="32" Padding="10,0" FontSize="12"
+                        Background="#F0F2F5" BorderBrush="#DADCE0" Foreground="#202124"
+                        Click="btnConnect_Click"/>
+            </Grid>
         </Grid>
 
         <!-- ==================== CỘT PHẢI: CHAT PANEL ==================== -->
@@ -67,7 +93,7 @@
                 </Grid.RowDefinitions>
 
                 <TextBlock Grid.Row="0" x:Name="txtChatTitle"
-                           Text="Chọn một thiết bị bên trái để bắt đầu chat"
+                           Text="{DynamicResource L_ChatEmpty}"
                            FontSize="15" FontWeight="Bold" Foreground="#202124" Margin="0,0,0,8"/>
 
                 <ListBox Grid.Row="1" x:Name="lstMessages" BorderThickness="0"
@@ -86,37 +112,46 @@
                 </ListBox>
 
                 <StackPanel Grid.Row="2" Margin="0,8,0,0">
-                    <!-- Progress truyền file — ẩn khi không có gì chạy -->
                     <Grid x:Name="pnlProgress" Visibility="Collapsed" Margin="0,0,0,8">
-                        <ProgressBar x:Name="barTransfer" Height="20" Minimum="0" Maximum="100"/>
-                        <TextBlock x:Name="txtTransfer" HorizontalAlignment="Center"
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="6"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <ProgressBar Grid.Column="0" x:Name="barTransfer" Height="20" Minimum="0" Maximum="100"/>
+                        <TextBlock Grid.Column="0" x:Name="txtTransfer" HorizontalAlignment="Center"
                                    VerticalAlignment="Center" FontSize="11"/>
+                        <Button Grid.Column="2" x:Name="btnCancelTransfer" Content="✕"
+                                Width="24" Height="20" FontSize="11" Padding="0"
+                                Background="#FCE8E6" BorderBrush="#F28B82" Foreground="#C5221F"
+                                ToolTip="{DynamicResource L_CancelTooltip}"
+                                Click="btnCancelTransfer_Click"/>
                     </Grid>
 
                     <Grid>
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="44"/>
-                        <ColumnDefinition Width="8"/>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="8"/>
-                        <ColumnDefinition Width="90"/>
-                    </Grid.ColumnDefinitions>
-                    <Button Grid.Column="0" x:Name="btnFile" Content="📎" Height="38" FontSize="16"
-                            Background="#F0F2F5" BorderBrush="#DADCE0"
-                            ToolTip="Gửi file (bên kia sẽ được hỏi trước khi nhận)"
-                            Click="btnFile_Click"/>
-                    <TextBox Grid.Column="2" x:Name="txtInput" Height="38" FontSize="14"
-                             VerticalContentAlignment="Center" Padding="8,0"
-                             KeyDown="txtInput_KeyDown"/>
-                    <Button Grid.Column="4" x:Name="btnSend" Content="Gửi" Height="38"
-                            Background="#34A853" Foreground="White" FontWeight="Bold"
-                            Click="btnSend_Click">
-                        <Button.Resources>
-                            <Style TargetType="Border">
-                                <Setter Property="CornerRadius" Value="8"/>
-                            </Style>
-                        </Button.Resources>
-                    </Button>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="44"/>
+                            <ColumnDefinition Width="8"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="8"/>
+                            <ColumnDefinition Width="90"/>
+                        </Grid.ColumnDefinitions>
+                        <Button Grid.Column="0" x:Name="btnFile" Content="📎" Height="38" FontSize="16"
+                                Background="#F0F2F5" BorderBrush="#DADCE0"
+                                ToolTip="{DynamicResource L_FileTooltip}"
+                                Click="btnFile_Click"/>
+                        <TextBox Grid.Column="2" x:Name="txtInput" Height="38" FontSize="14"
+                                 VerticalContentAlignment="Center" Padding="8,0"
+                                 KeyDown="txtInput_KeyDown"/>
+                        <Button Grid.Column="4" x:Name="btnSend" Content="{DynamicResource L_Send}"
+                                Height="38" Background="#34A853" Foreground="White" FontWeight="Bold"
+                                Click="btnSend_Click">
+                            <Button.Resources>
+                                <Style TargetType="Border">
+                                    <Setter Property="CornerRadius" Value="8"/>
+                                </Style>
+                            </Button.Resources>
+                        </Button>
                     </Grid>
                 </StackPanel>
             </Grid>

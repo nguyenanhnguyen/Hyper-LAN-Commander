@@ -14,73 +14,81 @@ namespace networkApp
         private readonly MessagingService _messaging;
         private readonly FileTransferService _files;
 
-        // Tên + fingerprint đã xác thực của từng IP (từ handshake ECDH)
-        private readonly Dictionary<string, string> _verifiedLabels = new();
-
         private readonly ObservableCollection<DeviceInfo> _devices = new();
-
-        // Lịch sử chat tách theo từng IP — đổi thiết bị vẫn giữ nguyên hội thoại
+        // Mọi thứ keyed theo endpoint "ip:port" (khớp với key của MessagingService)
         private readonly Dictionary<string, ObservableCollection<string>> _chatHistory = new();
-        private string? _activePeerIP;
+        private readonly Dictionary<string, string> _verifiedLabels = new();
+        private string? _activePeerKey;
+
+        private static string F(string key, params object[] args)
+            => string.Format(Localization.T(key), args);
+
+        // Tạo DeviceInfo từ một endpoint key
+        private static DeviceInfo DeviceFromKey(string key, string name)
+        {
+            int idx = key.LastIndexOf(':');
+            string ip = idx >= 0 ? key[..idx] : key;
+            return new DeviceInfo(ip, name) { Endpoint = key };
+        }
 
         public MainWindow()
         {
+            Localization.Initialize();
             InitializeComponent();
 
             _messaging = new MessagingService(_crypto);
 
             txtIP.Text = _discovery.LocalIP;
             txtFingerprint.Text = $"ID: {_crypto.Fingerprint}";
+            // Hiện cổng đang lắng nghe (khác 8889 khi đặt HLC_PORT để loopback test)
+            if (_messaging.ListenPort != MessagingService.DefaultPort)
+                Title += $"  (port {_messaging.ListenPort})";
             lstDevices.ItemsSource = _devices;
 
             // ---------- Discovery (UDP) ----------
             _discovery.OnDeviceDiscovered += device => Dispatcher.Invoke(() =>
             {
-                if (_devices.All(d => d.IpAddress != device.IpAddress))
+                if (_devices.All(d => d.Endpoint != device.Endpoint))
                 {
                     _devices.Add(device);
-                    txtStatus.Text = $"Đã thấy: {device}";
+                    txtStatus.Text = F("L_Seen", device);
                 }
             });
             _discovery.StartListening();
 
-            // ---------- Messaging (TCP) ----------
-            _messaging.OnTextReceived += (ip, text) => Dispatcher.Invoke(() =>
+            // ---------- Messaging (TCP, mã hóa) — tham số 'key' là endpoint ----------
+            _messaging.OnTextReceived += (key, text) => Dispatcher.Invoke(() =>
             {
-                GetHistory(ip).Add($"[{ip}] {text}");
-                // Nếu người gửi chưa có trong list thiết bị (chưa quét) thì vẫn hiện họ lên
-                if (_devices.All(d => d.IpAddress != ip))
-                    _devices.Add(new DeviceInfo(ip, "(chưa rõ tên)"));
-                ScrollChatToEnd(ip);
+                EnsureDevice(key, Localization.T("L_Unknown"));
+                GetHistory(key).Add($"[{key}] {text}");
+                ScrollChatToEnd(key);
             });
 
-            _messaging.OnPeerConnected += ip => Dispatcher.Invoke(() =>
-                txtStatus.Text = $"TCP: {ip} đã kết nối");
+            _messaging.OnPeerConnected += key => Dispatcher.Invoke(() =>
+                txtStatus.Text = F("L_TcpConnected", key));
 
-            _messaging.OnPeerIdentified += (ip, fingerprint, name) => Dispatcher.Invoke(() =>
+            _messaging.OnPeerIdentified += (key, fingerprint, name) => Dispatcher.Invoke(() =>
             {
-                _verifiedLabels[ip] = $"{name} · {fingerprint}";
-                txtStatus.Text = $"Đã xác thực: {name} ({fingerprint})";
-                if (ip == _activePeerIP)
-                    txtChatTitle.Text = $"🔒 {name} · {fingerprint}";
+                _verifiedLabels[key] = $"{name} · {fingerprint}";
+                EnsureDevice(key, name);
+                txtStatus.Text = F("L_Verified", name, fingerprint);
+                RefreshChatTitle();
             });
 
-            _messaging.OnKeyChanged += (ip, oldFp, newFp) => Dispatcher.Invoke(() =>
+            _messaging.OnKeyChanged += (key, oldFp, newFp) => Dispatcher.Invoke(() =>
             {
-                GetHistory(ip).Add($"⚠ CẢNH BÁO: danh tính tại {ip} đã THAY ĐỔI ({oldFp} → {newFp})!");
-                MessageBox.Show(
-                    $"Danh tính mật mã tại {ip} đã THAY ĐỔI!\n\n" +
-                    $"Trước: {oldFp}\nNay:   {newFp}\n\n" +
-                    "Có thể máy đó cài lại app... hoặc một máy KHÁC đang chiếm IP này.\n" +
-                    "Hãy xác nhận với người bên kia (đọc ID cho nhau) trước khi gửi thông tin nhạy cảm.",
-                    "Cảnh báo an ninh", MessageBoxButton.OK, MessageBoxImage.Warning);
+                GetHistory(key).Add(F("L_KeyChangedChat", key, oldFp, newFp));
+                MessageBox.Show(F("L_KeyChangedBody", key, oldFp, newFp),
+                    Localization.T("L_KeyChangedTitle"),
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
             });
 
-            _messaging.OnPeerDisconnected += ip => Dispatcher.Invoke(() =>
+            _messaging.OnPeerDisconnected += key => Dispatcher.Invoke(() =>
             {
-                txtStatus.Text = $"TCP: {ip} đã ngắt";
-                if (ip == _activePeerIP)
-                    GetHistory(ip).Add("— Kết nối đã đóng —");
+                txtStatus.Text = F("L_TcpDisconnected", key);
+                pnlProgress.Visibility = Visibility.Collapsed; // transfer dở dang → ẩn bar (fix đứng hình)
+                if (key == _activePeerKey)
+                    GetHistory(key).Add(Localization.T("L_ConnClosed"));
             });
 
             _messaging.StartListening();
@@ -88,60 +96,77 @@ namespace networkApp
             // ---------- File Transfer (consent-first + resume) ----------
             _files = new FileTransferService(_messaging);
 
-            _files.OnIncomingOffer += (ip, offer, resumeOffset) => Dispatcher.Invoke(async () =>
+            _files.OnIncomingOffer += (key, offer, resumeOffset) => Dispatcher.Invoke(async () =>
             {
-                double mb = offer.FileSize / 1024.0 / 1024.0;
+                string senderLabel = _verifiedLabels.TryGetValue(key, out string? label) ? label : key;
+                string mb = (offer.FileSize / 1024.0 / 1024.0).ToString("F1");
                 string resumeNote = resumeOffset > 0
-                    ? $"\n(Đã có {resumeOffset * 100 / Math.Max(offer.FileSize, 1)}% từ lần trước — sẽ tải tiếp)"
+                    ? F("L_OfferResume", resumeOffset * 100 / Math.Max(offer.FileSize, 1))
                     : "";
+
                 var choice = MessageBox.Show(
-                    $"{ip} muốn gửi file:\n\n{offer.FileName}  ({mb:F1} MB){resumeNote}\n\nNhận file này?",
-                    "Yêu cầu gửi file", MessageBoxButton.YesNo, MessageBoxImage.Question);
+                    F("L_OfferBody", senderLabel, offer.FileName, mb, resumeNote),
+                    Localization.T("L_OfferTitle"),
+                    MessageBoxButton.YesNo, MessageBoxImage.Question);
 
                 if (choice == MessageBoxResult.Yes)
-                    await _files.AcceptAsync(ip, offer);
+                    await _files.AcceptAsync(key, offer);
                 else
-                    await _files.RejectAsync(ip, offer);
+                    await _files.RejectAsync(key, offer);
             });
 
             _files.OnProgress += (name, done, total, sending) => Dispatcher.Invoke(() =>
             {
                 pnlProgress.Visibility = Visibility.Visible;
                 barTransfer.Value = total > 0 ? done * 100.0 / total : 0;
-                txtTransfer.Text = $"{(sending ? "Gửi" : "Nhận")} {name}: {done / 1048576.0:F1}/{total / 1048576.0:F1} MB";
+                string verb = Localization.T(sending ? "L_ProgSend" : "L_ProgRecv");
+                txtTransfer.Text = $"{verb} {name}: {done / 1048576.0:F1}/{total / 1048576.0:F1} MB";
             });
 
             _files.OnCompleted += (nameOrPath, sending) => Dispatcher.Invoke(() =>
             {
                 pnlProgress.Visibility = Visibility.Collapsed;
-                if (_activePeerIP is not null)
-                    GetHistory(_activePeerIP).Add(sending
-                        ? $"— Đã gửi xong: {System.IO.Path.GetFileName(nameOrPath)} —"
-                        : $"— Đã nhận file: {nameOrPath} —");
-                txtStatus.Text = sending ? "Gửi file hoàn tất" : "Nhận file hoàn tất";
+                if (_activePeerKey is not null)
+                    GetHistory(_activePeerKey).Add(sending
+                        ? F("L_SentDone", System.IO.Path.GetFileName(nameOrPath))
+                        : F("L_RecvDone", nameOrPath));
+                txtStatus.Text = Localization.T(sending ? "L_SentStatus" : "L_RecvStatus");
             });
 
             _files.OnFailed += (name, reason) => Dispatcher.Invoke(() =>
             {
                 pnlProgress.Visibility = Visibility.Collapsed;
-                txtStatus.Text = $"File {name}: {reason}";
+                txtStatus.Text = F("L_FileFail", name, reason);
+            });
+
+            _files.OnCanceled += name => Dispatcher.Invoke(() =>
+            {
+                pnlProgress.Visibility = Visibility.Collapsed;
+                if (_activePeerKey is not null)
+                    GetHistory(_activePeerKey).Add(F("L_Canceled", name));
+                txtStatus.Text = F("L_Canceled", name);
             });
         }
 
-        private async void btnFile_Click(object sender, RoutedEventArgs e)
+        private async void btnCancelTransfer_Click(object sender, RoutedEventArgs e)
         {
-            if (_activePeerIP is null)
-            {
-                txtStatus.Text = "Hãy chọn một thiết bị trước";
-                return;
-            }
+            await _files.CancelAllAsync();
+        }
 
-            var dialog = new Microsoft.Win32.OpenFileDialog { Title = "Chọn file để gửi" };
-            if (dialog.ShowDialog() != true) return;
+        // =============== NGÔN NGỮ ===============
 
-            string target = _activePeerIP;
-            GetHistory(target).Add($"— Đang mời {target} nhận file {System.IO.Path.GetFileName(dialog.FileName)}... —");
-            await _files.SendFileAsync(target, dialog.FileName);
+        private void btnLang_Click(object sender, RoutedEventArgs e)
+        {
+            Localization.Toggle();
+            RefreshChatTitle();
+        }
+
+        private void RefreshChatTitle()
+        {
+            if (_activePeerKey is null) return;
+            txtChatTitle.Text = _verifiedLabels.TryGetValue(_activePeerKey, out string? label)
+                ? $"🔒 {label}"
+                : F("L_ChatWith", _activePeerKey);
         }
 
         // =============== DISCOVERY UI ===============
@@ -149,31 +174,67 @@ namespace networkApp
         private async void btnScan_Click(object sender, RoutedEventArgs e)
         {
             btnScan.IsEnabled = false;
-            txtStatus.Text = "Trạng thái: Đang quét...";
+            txtStatus.Text = Localization.T("L_Scanning");
             _devices.Clear();
             try
             {
                 await _discovery.ScanAsync();
                 txtStatus.Text = _devices.Count > 0
-                    ? $"Quét xong: {_devices.Count} thiết bị"
-                    : "Quét xong: không thấy thiết bị nào";
+                    ? F("L_ScanDone", _devices.Count)
+                    : Localization.T("L_ScanNone");
             }
-            catch (Exception ex) { txtStatus.Text = $"Lỗi quét: {ex.Message}"; }
+            catch (Exception ex) { txtStatus.Text = F("L_ScanError", ex.Message); }
             finally { btnScan.IsEnabled = true; }
+        }
+
+        // =============== KẾT NỐI THỦ CÔNG (loopback test / nhập IP tay) ===============
+
+        private async void btnConnect_Click(object sender, RoutedEventArgs e)
+        {
+            string input = txtManual.Text.Trim();
+            if (string.IsNullOrEmpty(input)) return;
+
+            // Cho phép gõ "127.0.0.1:8890", "192.168.1.5", hoặc chỉ "8890" (→ 127.0.0.1:8890)
+            string host; int port;
+            if (input.Contains(':'))
+            {
+                int idx = input.LastIndexOf(':');
+                host = input[..idx];
+                if (!int.TryParse(input[(idx + 1)..], out port)) { txtStatus.Text = F("L_ConnectFail", input); return; }
+            }
+            else if (int.TryParse(input, out int p))
+            {
+                host = "127.0.0.1"; port = p;
+            }
+            else
+            {
+                host = input; port = MessagingService.DefaultPort;
+            }
+
+            txtManual.Clear();
+            try
+            {
+                string key = await _messaging.ConnectAsync(host, port);
+                EnsureDevice(key, Localization.T("L_ManualName"));
+                SelectDevice(key);
+            }
+            catch (Exception ex) { txtStatus.Text = F("L_ConnectFail", ex.Message); }
         }
 
         // =============== CHAT UI ===============
 
         private void lstDevices_SelectionChanged(object sender, RoutedEventArgs e)
         {
-            if (lstDevices.SelectedItem is not DeviceInfo device) return;
+            if (lstDevices.SelectedItem is DeviceInfo device)
+                SelectDevice(device.Endpoint);
+        }
 
-            _activePeerIP = device.IpAddress;
-            txtChatTitle.Text = _verifiedLabels.TryGetValue(device.IpAddress, out string? label)
-                ? $"🔒 {label}"
-                : $"Chat với {device}";
-            lstMessages.ItemsSource = GetHistory(device.IpAddress);
-            ScrollChatToEnd(device.IpAddress);
+        private void SelectDevice(string key)
+        {
+            _activePeerKey = key;
+            RefreshChatTitle();
+            lstMessages.ItemsSource = GetHistory(key);
+            ScrollChatToEnd(key);
             txtInput.Focus();
         }
 
@@ -188,41 +249,57 @@ namespace networkApp
         {
             string text = txtInput.Text.Trim();
             if (string.IsNullOrEmpty(text)) return;
+            if (_activePeerKey is null) { txtStatus.Text = Localization.T("L_SelectFirst"); return; }
 
-            if (_activePeerIP is null)
-            {
-                txtStatus.Text = "Hãy chọn một thiết bị trước";
-                return;
-            }
-
-            string target = _activePeerIP;
+            string target = _activePeerKey;
             txtInput.Clear();
             try
             {
                 await _messaging.SendTextAsync(target, text);
-                GetHistory(target).Add($"[Bạn] {text}");
+                GetHistory(target).Add($"[{Localization.T("L_You")}] {text}");
                 ScrollChatToEnd(target);
             }
             catch (Exception ex)
             {
-                GetHistory(target).Add($"— Gửi thất bại: {ex.Message} —");
+                GetHistory(target).Add(F("L_SendFail", ex.Message));
                 ScrollChatToEnd(target);
             }
         }
 
-        private ObservableCollection<string> GetHistory(string ip)
+        private async void btnFile_Click(object sender, RoutedEventArgs e)
         {
-            if (!_chatHistory.TryGetValue(ip, out var history))
+            if (_activePeerKey is null) { txtStatus.Text = Localization.T("L_SelectFirst"); return; }
+
+            var dialog = new Microsoft.Win32.OpenFileDialog { Title = Localization.T("L_ChooseFile") };
+            if (dialog.ShowDialog() != true) return;
+
+            string target = _activePeerKey;
+            GetHistory(target).Add(F("L_Inviting", target, System.IO.Path.GetFileName(dialog.FileName)));
+            await _files.SendFileAsync(target, dialog.FileName);
+        }
+
+        // =============== HELPERS ===============
+
+        private void EnsureDevice(string key, string name)
+        {
+            var existing = _devices.FirstOrDefault(d => d.Endpoint == key);
+            if (existing is null)
+                _devices.Add(DeviceFromKey(key, name));
+        }
+
+        private ObservableCollection<string> GetHistory(string key)
+        {
+            if (!_chatHistory.TryGetValue(key, out var history))
             {
                 history = new ObservableCollection<string>();
-                _chatHistory[ip] = history;
+                _chatHistory[key] = history;
             }
             return history;
         }
 
-        private void ScrollChatToEnd(string ip)
+        private void ScrollChatToEnd(string key)
         {
-            if (ip != _activePeerIP || lstMessages.Items.Count == 0) return;
+            if (key != _activePeerKey || lstMessages.Items.Count == 0) return;
             lstMessages.ScrollIntoView(lstMessages.Items[^1]);
         }
 

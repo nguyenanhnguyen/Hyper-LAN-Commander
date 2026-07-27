@@ -16,7 +16,12 @@ namespace networkApp
     public record DeviceInfo(string IpAddress, string HostName)
     {
         public DateTime LastSeen { get; set; } = DateTime.Now;
-        public override string ToString() => $"{HostName}  ({IpAddress})";
+
+        /// <summary>Key định danh + đích kết nối TCP. Mặc định dùng cổng chuẩn;
+        /// peer kết nối thủ công (loopback test) sẽ ghi đè cổng khác.</summary>
+        public string Endpoint { get; init; } = $"{IpAddress}:{MessagingService.DefaultPort}";
+
+        public override string ToString() => $"{HostName}  ({Endpoint})";
     }
 
     /// <summary>
@@ -33,7 +38,7 @@ namespace networkApp
         private const int DiscoveryPort = 8888;
         private const string ProtocolId = "HLC1";           // đổi version protocol thì tăng số này
         private const string MsgDiscover = ProtocolId + "|DISCOVER|";
-        private const string MsgReply    = ProtocolId + "|REPLY|";
+        private const string MsgReply = ProtocolId + "|REPLY|";
 
         private readonly UdpClient _listener;
         private readonly CancellationTokenSource _cts = new();
