@@ -39,6 +39,13 @@ namespace networkApp
         FileComplete = 0x14, // [16B id][32B SHA-256 toàn file]
         FileCancel = 0x15,   // hủy giữa chừng (giữ .part để resume)
         FileResult = 0x16,   // [16B id][1B status] — bên nhận xác nhận đã kiểm SHA-256
+
+        // Đo đường truyền (Tools → Link test): RTT/jitter + thông lượng qua kênh MÃ HÓA thật
+        LinkEcho = 0x20,        // [8B seq][8B t0] → bên kia phản hồi LinkEchoReply y nguyên
+        LinkEchoReply = 0x21,
+        LinkProbe = 0x22,       // [16B testId][dữ liệu ngẫu nhiên] — bulk, bên nhận chỉ đếm byte
+        LinkProbeEnd = 0x23,    // [16B testId]
+        LinkProbeResult = 0x24, // [16B testId][8B bytes][8B elapsedMs]
     }
 
     /// <summary>

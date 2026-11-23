@@ -180,6 +180,12 @@ namespace networkApp
             return sb.ToString();
         }
 
+        /// <summary>
+        /// CHỈ cho Attack Lab (danh tính TẠM sinh trong phòng lab): mô phỏng kẻ tấn công đã đánh cắp
+        /// khóa dài hạn, để chứng minh traffic đã ghi lại vẫn không giải mã được (forward secrecy).
+        /// </summary>
+        internal ECParameters ExportPrivateForLab() => _identity.ExportParameters(includePrivateParameters: true);
+
         public void Dispose() => _identity.Dispose();
     }
 

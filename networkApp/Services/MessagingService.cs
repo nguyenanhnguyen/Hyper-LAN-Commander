@@ -29,6 +29,20 @@ namespace networkApp
         public IPEndPoint ListenEndPoint => new(RemoteEndPoint.Address, ListenPort);
     }
 
+    /// <summary>Một sự kiện ở tầng dây cho Protocol Inspector.</summary>
+    public sealed record FrameTrace(
+        DateTime Time,
+        long ConnectionId,
+        string Peer,
+        bool Outgoing,
+        string Kind,          // "Hello" / "Sealed" / "KEY" / "AUTH" / "CLOSE"
+        PacketType? Inner,    // loại gói thật (chỉ người trong cuộc biết)
+        int WireBytes,
+        ulong? Sequence,      // nonce counter của AES-GCM
+        string CipherHex,     // 16 byte đầu trên dây — đúng thứ kẻ nghe lén nhìn thấy
+        string Note,
+        int Aggregated = 1);  // >1: gộp nhiều FileChunk để không ngập UI
+
     public enum CloseReason { Closed, PeerLeft, Timeout, NetworkError, Tampered, ProtocolError, AuthFailed, Replaced, SelfConnection, Shutdown }
 
     /// <summary>Không có/mất đường tới peer. Là IOException → tầng trên coi là lỗi mạng tạm thời.</summary>
@@ -94,16 +108,38 @@ namespace networkApp
         public event Action<string, string>? TextReceived;                  // fp, text
         public event Action<string, CloseReason, string>? ConnectionRejected; // endpoint, lý do, chi tiết
 
-        /// <summary>Handler cho các gói không phải chat/điều khiển (file...). Được AWAIT trong
-        /// vòng đọc → tự tạo backpressure. Payload chỉ hợp lệ trong lúc gọi (buffer được tái sử dụng).
+        /// <summary>Handler theo loại gói (file, link-test...). Được AWAIT trong vòng đọc → tự tạo
+        /// backpressure. Payload chỉ hợp lệ trong lúc gọi (buffer được tái sử dụng).
         /// KHÔNG được await việc GỬI bên trong handler (dùng fire-and-forget) để tránh deadlock.</summary>
-        public Func<string, PacketType, ReadOnlyMemory<byte>, ValueTask>? FrameHandler { get; set; }
+        public delegate ValueTask FrameHandlerFn(string fingerprint, PacketType type, ReadOnlyMemory<byte> payload);
 
-        public MessagingService(CryptoService crypto, string localName, int preferredPort = DefaultPort)
+        private readonly ConcurrentDictionary<PacketType, FrameHandlerFn> _handlers = new();
+
+        public void RegisterHandler(FrameHandlerFn handler, params PacketType[] types)
+        {
+            foreach (var t in types) _handlers[t] = handler;
+        }
+
+        public void UnregisterHandler(params PacketType[] types)
+        {
+            foreach (var t in types) _handlers.TryRemove(t, out _);
+        }
+
+        // ---------- Protocol Inspector ----------
+        /// <summary>Bật để nhận FrameTraced cho từng record (tốn chút CPU — chỉ bật khi Inspector mở).</summary>
+        public bool TraceEnabled { get; set; }
+        public event Action<FrameTrace>? FrameTraced;
+
+        private readonly IPAddress? _bindAddress;
+
+        /// <param name="bindAddress">null = mọi card mạng (dual-stack). Attack Lab dùng 127.0.0.1 để không lộ ra LAN.</param>
+        public MessagingService(CryptoService crypto, string localName, int preferredPort = DefaultPort,
+                                IPAddress? bindAddress = null)
         {
             _crypto = crypto;
             _localName = localName.Length > 64 ? localName[..64] : localName;
             _preferredPort = preferredPort;
+            _bindAddress = bindAddress;
         }
 
         // =====================================================================
@@ -112,7 +148,7 @@ namespace networkApp
 
         public void Start()
         {
-            _listener = CreateListener(_preferredPort, out int port);
+            _listener = CreateListener(_preferredPort, _bindAddress, out int port);
             ListenPort = port;
             _ = Task.Run(AcceptLoopAsync);
         }
@@ -121,18 +157,20 @@ namespace networkApp
         /// Socket dual-stack (IPv6 + IPv4-mapped) nếu hệ thống hỗ trợ. Cổng bị chiếm
         /// (instance khác đang chạy) → thử các cổng kế tiếp; discovery sẽ quảng bá cổng THẬT.
         /// </summary>
-        private static TcpListener CreateListener(int preferred, out int actualPort)
+        private static TcpListener CreateListener(int preferred, IPAddress? bind, out int actualPort)
         {
-            var candidates = Enumerable.Range(preferred, 12).Where(p => p < 65536).Append(0);
+            var candidates = (preferred == 0 ? Enumerable.Empty<int>() : Enumerable.Range(preferred, 12))
+                             .Where(p => p < 65536).Append(0);
             foreach (int port in candidates)
             {
                 foreach (bool dual in new[] { true, false })
                 {
-                    if (dual && !Socket.OSSupportsIPv6) continue;
+                    if (dual && (!Socket.OSSupportsIPv6 || bind is not null)) continue;
                     TcpListener? l = null;
                     try
                     {
-                        l = dual ? new TcpListener(IPAddress.IPv6Any, port) : new TcpListener(IPAddress.Any, port);
+                        l = bind is not null ? new TcpListener(bind, port)
+                          : dual ? new TcpListener(IPAddress.IPv6Any, port) : new TcpListener(IPAddress.Any, port);
                         if (dual) l.Server.DualMode = true;
                         l.Server.ExclusiveAddressUse = true;
                         l.Start(backlog: 64);
@@ -155,7 +193,13 @@ namespace networkApp
                 try
                 {
                     TcpClient client = await _listener!.AcceptTcpClientAsync(_cts.Token).ConfigureAwait(false);
-                    if (_all.Count >= MaxConnections) { client.Dispose(); continue; } // chống tràn kết nối
+                    if (!AdmitConnection(client))
+                    {
+                        Interlocked.Increment(ref _refusedFlood);
+                        client.Client.LingerState = new LingerOption(true, 0); // RST ngay, không giữ TIME_WAIT
+                        client.Dispose();
+                        continue;
+                    }
                     StartConnection(client, isInitiator: false);
                 }
                 catch (OperationCanceledException) { break; }
@@ -166,6 +210,26 @@ namespace networkApp
                     try { await Task.Delay(200, _cts.Token).ConfigureAwait(false); } catch { break; }
                 }
             }
+        }
+
+        private const int MaxPendingPerIp = 16;
+        private long _refusedFlood;
+        /// <summary>Số kết nối bị từ chối ngay ở cửa (flood / quá hạn mức mỗi IP).</summary>
+        public long RefusedConnections => Interlocked.Read(ref _refusedFlood);
+
+        /// <summary>
+        /// Kiểm soát cửa vào (chống connection-flood / slowloris):
+        ///  • tổng tối đa 64 kết nối;
+        ///  • mỗi IP tối đa 16 kết nối CHƯA xác thực — một máy tấn công không thể chiếm hết chỗ
+        ///    và khóa người dùng hợp lệ ở máy khác. Kết nối chưa bắt tay xong bị đá sau 6s.
+        /// </summary>
+        private bool AdmitConnection(TcpClient client)
+        {
+            if (_all.Count >= MaxConnections) return false;
+            if (client.Client.RemoteEndPoint is not IPEndPoint rep) return false;
+            var ip = Normalize(rep).Address;
+            int pending = _all.Values.Count(c => !c.Authenticated.Task.IsCompleted && c.Remote.Address.Equals(ip));
+            return pending < MaxPendingPerIp;
         }
 
         // =====================================================================
@@ -437,6 +501,9 @@ namespace networkApp
 
             public long LastRxTick = Environment.TickCount64;
             public volatile int RttMs = -1;
+            // Inspector: gộp record dữ liệu khối (mỗi chiều một bộ đếm, chỉ 1 thread chạm vào)
+            public int TxAgg, RxAgg;
+            public long TxAggBytes, RxAggBytes, TxAggTick, RxAggTick;
             public volatile bool Draining;   // đang đóng êm: không nhận gói mới
             public int ClosedFlag;
             public CloseReason Reason = CloseReason.Closed;
@@ -539,6 +606,10 @@ namespace networkApp
                 c.MyHello.CopyTo(hello, Protocol.HeaderSize);
                 await c.Stream.WriteAsync(hello, ct).ConfigureAwait(false);
                 Interlocked.Add(ref _bytesSent, hello.Length);
+                if (TraceEnabled)
+                    Emit(new FrameTrace(DateTime.Now, c.Id, PeerLabel(c), true, "Hello", null, hello.Length, null,
+                        Convert.ToHexString(c.MyHello, 0, Math.Min(16, c.MyHello.Length)),
+                        $"Hello · Id={_crypto.Fingerprint} · Eph=P-256 (ephemeral) · Nonce=32B · PLAINTEXT (public values only)"));
 
                 // 2) Chờ có khóa phiên, sau đó mọi thứ đều Sealed
                 await c.KeysReady.Task.WaitAsync(ct).ConfigureAwait(false);
@@ -588,12 +659,16 @@ namespace networkApp
                 Protocol.WriteHeader(buf, RecordType.Sealed, bodyLen);
                 buf[Protocol.HeaderSize] = (byte)f.Type;
                 f.Buffer.AsSpan(f.Offset, f.Count).CopyTo(buf.AsSpan(Protocol.HeaderSize + 1));
-                c.Tx!.SealInPlace(buf.AsSpan(Protocol.HeaderSize, plainLen),
-                                  buf.AsSpan(Protocol.HeaderSize + plainLen, Protocol.TagSize),
-                                  buf.AsSpan(0, Protocol.HeaderSize)); // AAD = header
+                ulong seq = c.Tx!.Counter;
+                c.Tx.SealInPlace(buf.AsSpan(Protocol.HeaderSize, plainLen),
+                                 buf.AsSpan(Protocol.HeaderSize + plainLen, Protocol.TagSize),
+                                 buf.AsSpan(0, Protocol.HeaderSize)); // AAD = header
                 await c.Stream.WriteAsync(buf.AsMemory(0, total), ct).ConfigureAwait(false);
                 Interlocked.Add(ref _bytesSent, total);
                 f.Done?.TrySetResult();
+                if (TraceEnabled)
+                    TraceSealed(c, true, f.Type, total, seq, buf.AsSpan(Protocol.HeaderSize, bodyLen), f.Count,
+                                ref c.TxAgg, ref c.TxAggBytes, ref c.TxAggTick);
             }
             catch (Exception ex)
             {
@@ -613,6 +688,7 @@ namespace networkApp
         {
             CancellationToken ct = c.Cts.Token;
             byte[] header = new byte[Protocol.HeaderSize];
+            byte[] wirePreview = new byte[16];
             CloseReason reason = CloseReason.Closed;
             try
             {
@@ -636,10 +712,15 @@ namespace networkApp
                     await c.Stream.ReadExactlyAsync(auth, hs.Token).ConfigureAwait(false);
                     Interlocked.Add(ref _bytesReceived, Protocol.HeaderSize + len);
                     int plain = len - Protocol.TagSize;
+                    string authHex = Convert.ToHexString(auth, 0, Math.Min(16, len));
                     c.Rx!.OpenInPlace(auth.AsSpan(0, plain), auth.AsSpan(plain, Protocol.TagSize), header);
                     if ((PacketType)auth[0] != PacketType.Auth)
                         throw new HlcProtocolException("Gói Sealed đầu tiên phải là Auth");
                     VerifyAuth(c, auth.AsSpan(1, plain - 1));
+                    if (TraceEnabled)
+                        Emit(new FrameTrace(DateTime.Now, c.Id, PeerLabel(c), false, "AUTH", PacketType.Auth,
+                            Protocol.HeaderSize + len, 0, authHex,
+                            $"ECDSA-P256 signature over transcript ✓ · decrypted with fresh key (key confirmation) · identity {c.Fingerprint}"));
                 }
                 OnAuthenticated(c);
 
@@ -658,7 +739,14 @@ namespace networkApp
                         Interlocked.Add(ref _bytesReceived, Protocol.HeaderSize + len);
 
                         int plain = len - Protocol.TagSize;
+                        ulong seq = c.Rx!.Counter;
+                        bool tracing = TraceEnabled;
+                        if (tracing) Buffer.BlockCopy(buf, 0, wirePreview, 0, Math.Min(16, len));
                         c.Rx.OpenInPlace(buf.AsSpan(0, plain), buf.AsSpan(plain, Protocol.TagSize), header);
+                        if (tracing)
+                            TraceSealed(c, false, (PacketType)buf[0], Protocol.HeaderSize + len, seq,
+                                        wirePreview.AsSpan(0, Math.Min(16, len)), plain - 1,
+                                        ref c.RxAgg, ref c.RxAggBytes, ref c.RxAggTick);
                         await DispatchAsync(c, (PacketType)buf[0], buf.AsMemory(1, plain - 1)).ConfigureAwait(false);
                     }
                     finally
@@ -667,7 +755,11 @@ namespace networkApp
                     }
                 }
             }
-            catch (AuthenticationTagMismatchException) { reason = CloseReason.Tampered; }
+            catch (AuthenticationTagMismatchException)
+            {
+                // Sai tag LÚC BẮT TAY = hai bên không cùng khóa (vd. MITM thay khóa tạm) → xác thực thất bại
+                reason = c.Info is null ? CloseReason.AuthFailed : CloseReason.Tampered;
+            }
             catch (CryptographicException) { reason = c.Info is null ? CloseReason.AuthFailed : CloseReason.Tampered; }
             catch (SelfConnectionException) { reason = CloseReason.SelfConnection; }
             catch (HlcProtocolException) { reason = CloseReason.ProtocolError; }
@@ -713,6 +805,18 @@ namespace networkApp
             c.Transcript = keys.Transcript;
             c.PeerHello = h with { Name = Clean(h.Name) };
             c.Fingerprint = fp;
+
+            if (TraceEnabled)
+            {
+                Emit(new FrameTrace(DateTime.Now, c.Id, PeerLabel(c), false, "Hello", null,
+                    Protocol.HeaderSize + helloBytes.Length, null,
+                    Convert.ToHexString(helloBytes, 0, Math.Min(16, helloBytes.Length)),
+                    $"Peer Hello · Id={fp} · Eph=P-256 · v{h.V} · port {h.Port} · PLAINTEXT"));
+                Emit(new FrameTrace(DateTime.Now, c.Id, PeerLabel(c), false, "KEY", null, 0, null,
+                    Convert.ToHexString(keys.Transcript, 0, 8),
+                    $"ECDHE(P-256) → Z · HKDF-SHA256(salt = SHA-256(transcript)) → k_i2r, k_r2i (AES-256-GCM) · " +
+                    $"role {(c.IsInitiator ? "initiator" : "responder")} · ephemeral private key DESTROYED (PFS)"));
+            }
 
             // Auth phải là gói Sealed ĐẦU TIÊN → enqueue trước khi mở cổng cho writer
             byte[] sig = _crypto.Sign(Handshake.AuthData(keys.Transcript, c.IsInitiator));
@@ -824,7 +928,7 @@ namespace networkApp
 
         private async ValueTask InvokeFrameHandlerAsync(string fp, PacketType type, ReadOnlyMemory<byte> payload)
         {
-            if (FrameHandler is not { } handler) return;
+            if (!_handlers.TryGetValue(type, out var handler)) return; // loại gói chưa ai đăng ký → bỏ qua
             try { await handler(fp, type, payload).ConfigureAwait(false); }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -882,13 +986,69 @@ namespace networkApp
             _all.TryRemove(c.Id, out _);
             DetachSession(c, c.Reason);
 
+            if (TraceEnabled)
+                Emit(new FrameTrace(DateTime.Now, c.Id, PeerLabel(c), false, "CLOSE", null, 0, null, "",
+                    $"Connection closed: {c.Reason}"));
+
             if (!c.Authenticated.Task.IsCompleted)
             {
                 c.Authenticated.TrySetException(new PeerUnavailableException(DescribeReject(c.Reason), c.Reason));
                 if (c.Reason is CloseReason.Tampered or CloseReason.AuthFailed or CloseReason.ProtocolError
-                             or CloseReason.SelfConnection)
+                             or CloseReason.SelfConnection or CloseReason.Timeout)
+                {
+                    Interlocked.Increment(ref _rejected);
                     Raise(() => ConnectionRejected?.Invoke(c.Remote.ToString(), c.Reason, DescribeReject(c.Reason)));
+                }
             }
+            else if (c.Reason == CloseReason.Tampered)
+            {
+                Interlocked.Increment(ref _rejected);
+            }
+        }
+
+        private long _rejected;
+        /// <summary>Số kết nối/phiên bị cắt vì lý do an ninh (giả mạo, sai chữ ký, sai giao thức...).</summary>
+        public long RejectedConnections => Interlocked.Read(ref _rejected);
+
+        // ---------------- Protocol Inspector ----------------
+
+        private static string PeerLabel(Connection c) => c.Info?.Name ?? c.PeerHello?.Name ?? c.Remote.ToString();
+
+        private void Emit(FrameTrace t)
+        {
+            try { FrameTraced?.Invoke(t); }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"[Trace] {ex.Message}"); }
+        }
+
+        /// <summary>Ghi lại một record Sealed. Record dữ liệu khối được GỘP (tối đa ~4 dòng/giây/chiều).</summary>
+        private void TraceSealed(Connection c, bool outgoing, PacketType inner, int wire, ulong seq,
+                                 ReadOnlySpan<byte> cipherPreview, int plainLen,
+                                 ref int agg, ref long aggBytes, ref long aggTick)
+        {
+            if (inner is PacketType.FileChunk or PacketType.LinkProbe)
+            {
+                agg++;
+                aggBytes += wire;
+                long now = Environment.TickCount64;
+                if (now - aggTick < 250) return;
+                aggTick = now;
+                int n = agg; long b = aggBytes;
+                agg = 0; aggBytes = 0;
+                Emit(new FrameTrace(DateTime.Now, c.Id, PeerLabel(c), outgoing, "Sealed", inner, (int)Math.Min(b, int.MaxValue),
+                    seq, Convert.ToHexString(cipherPreview), $"{n} bulk records · {b / 1024} KB · seq up to {seq}", n));
+                return;
+            }
+            string note = inner switch
+            {
+                PacketType.Ping => "heartbeat ping (RTT probe)",
+                PacketType.Pong => "heartbeat pong",
+                PacketType.Auth => "ECDSA signature over handshake transcript",
+                PacketType.Text => $"chat message · {plainLen} B plaintext",
+                PacketType.Bye => "graceful close",
+                _ => $"{plainLen} B plaintext",
+            };
+            Emit(new FrameTrace(DateTime.Now, c.Id, PeerLabel(c), outgoing, "Sealed", inner, wire, seq,
+                Convert.ToHexString(cipherPreview), note));
         }
 
         private void DetachSession(Connection c, CloseReason reason)

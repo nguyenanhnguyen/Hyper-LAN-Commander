@@ -46,8 +46,9 @@ namespace networkApp
             PreferredTcpPort = port;
 
             string? envName = Environment.GetEnvironmentVariable("HLC_NAME");
-            string baseName = string.IsNullOrWhiteSpace(envName) ? Environment.MachineName : envName.Trim();
-            DisplayName = IsDefault ? baseName : $"{baseName} #{name}";
+            DisplayName = !string.IsNullOrWhiteSpace(envName) ? envName.Trim()
+                        : IsDefault ? Environment.MachineName
+                        : $"{Environment.MachineName} #{name}";
         }
 
         public static AppProfile Acquire()

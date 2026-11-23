@@ -107,6 +107,9 @@ namespace networkApp
         private readonly AesGcm _aes;
         private ulong _counter;
 
+        /// <summary>Số thứ tự (= nonce) của record KẾ TIẾP — hiển thị trong Protocol Inspector.</summary>
+        public ulong Counter => _counter;
+
         public CipherState(byte[] key)
         {
             _aes = new AesGcm(key, Protocol.TagSize);

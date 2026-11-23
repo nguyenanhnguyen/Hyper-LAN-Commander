@@ -8,8 +8,7 @@ namespace networkApp
     /// <summary>
     /// Song ngữ EN/VI theo cơ chế DynamicResource của WPF:
     /// - Mọi chuỗi UI nằm ở đây, bơm vào Application.Resources.
-    /// - Label trong XAML dùng {DynamicResource key} → đổi ngôn ngữ là
-    ///   TỰ CẬP NHẬT ngay, không cần restart.
+    /// - Label trong XAML dùng {DynamicResource key} → đổi ngôn ngữ là TỰ CẬP NHẬT ngay.
     /// - Chuỗi động trong code lấy qua Localization.T(key) + string.Format.
     /// - Lựa chọn được lưu ở %AppData%\HyperLAN\lang.cfg cho lần mở sau.
     /// </summary>
@@ -19,9 +18,7 @@ namespace networkApp
         public const string EN = "en";
         public static string Current { get; private set; } = VI;
 
-        private static readonly string ConfigPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-            "HyperLAN", "lang.cfg");
+        private static readonly string ConfigPath = Path.Combine(AppProfile.RootDataDir, "lang.cfg");
 
         // key → (tiếng Việt, English)
         private static readonly Dictionary<string, (string vi, string en)> Strings = new()
@@ -29,70 +26,136 @@ namespace networkApp
             // Nút chuyển ngôn ngữ hiển thị NGÔN NGỮ SẼ CHUYỂN SANG
             ["L_LangToggle"] = ("EN", "VI"),
 
-            // ---- Nhãn tĩnh trong XAML ----
-            ["L_YourIP"] = ("Địa chỉ IP của bạn:", "Your IP address:"),
-            ["L_StatusReady"] = ("Trạng thái: Sẵn sàng", "Status: Ready"),
-            ["L_Devices"] = ("Thiết bị trong mạng:", "Devices on this network:"),
-            ["L_Scan"] = ("QUÉT MẠNG", "SCAN NETWORK"),
+            // ---- Sidebar ----
+            ["L_Tagline"] = ("Mạng LAN mã hóa đầu-cuối", "End-to-end encrypted LAN"),
+            ["L_YourIdentity"] = ("DANH TÍNH CỦA BẠN", "YOUR IDENTITY"),
+            ["L_CopyId"] = ("Sao chép fingerprint", "Copy fingerprint"),
+            ["L_Copied"] = ("Đã sao chép fingerprint", "Fingerprint copied"),
+            ["L_Devices"] = ("THIẾT BỊ", "DEVICES"),
+            ["L_OnlineCount"] = ("{0} online", "{0} online"),
+            ["L_Scan"] = ("Quét mạng", "Scan network"),
             ["L_Connect"] = ("Kết nối", "Connect"),
-            ["L_ManualTooltip"] = ("Nhập IP:port để kết nối thủ công. Test trên 1 máy: gõ cổng của instance kia, vd 8890.",
-                                  "Enter IP:port to connect manually. Single-machine test: type the other instance's port, e.g. 8890."),
-            ["L_ManualName"] = ("(thủ công)", "(manual)"),
-            ["L_ConnectFail"] = ("Kết nối thất bại: {0}", "Connection failed: {0}"),
-            ["L_ChatEmpty"] = ("Chọn một thiết bị bên trái để bắt đầu chat",
-                                  "Select a device on the left to start chatting"),
+            ["L_ManualHint"] = ("IP hoặc IP:port", "IP or IP:port"),
+            ["L_ManualTooltip"] = ("Kết nối thủ công khi discovery bị chặn (vd: mạng công ty, khác subnet).",
+                                   "Connect manually when discovery is blocked (e.g. corporate network, different subnet)."),
+            ["L_OpenDownloads"] = ("Mở thư mục nhận file", "Open received files folder"),
+            ["L_InterfacesTip"] = ("Các card mạng đang phát discovery:", "Network interfaces used for discovery:"),
+            ["L_FpTooltip"] = ("Danh tính mật mã của máy này — không thể giả mạo. Đọc cho bạn bè để họ đối chiếu.",
+                               "This machine's cryptographic identity — cannot be forged. Read it aloud so peers can verify."),
+            ["L_StSecure"] = ("Phiên mã hóa", "Secure session"),
+            ["L_StOnline"] = ("Online", "Online"),
+            ["L_StOffline"] = ("Offline", "Offline"),
+            ["L_BadgeNew"] = ("MỚI", "NEW"),
+            ["L_BadgeVerified"] = ("✓ ĐÃ XÁC MINH", "✓ VERIFIED"),
+            ["L_NoDevices"] = ("Chưa thấy thiết bị nào.\nMở Hyper-LAN trên máy khác cùng mạng — nó sẽ tự xuất hiện ở đây.",
+                               "No devices yet.\nRun Hyper-LAN on another machine on this network — it will appear here automatically."),
+
+            // ---- Chat ----
+            ["L_ChatEmptyTitle"] = ("Chọn một thiết bị để bắt đầu", "Pick a device to get started"),
+            ["L_ChatEmptyBody"] = ("Tin nhắn và file được mã hóa đầu-cuối bằng AES-256-GCM.\nKhóa phiên dẫn xuất từ ECDH tạm thời — không bao giờ đi qua mạng.",
+                                   "Messages and files are end-to-end encrypted with AES-256-GCM.\nSession keys come from ephemeral ECDH — they never cross the network."),
+            ["L_Feat1"] = ("🔍  Tự phát hiện máy trong LAN (broadcast + multicast trên mọi card mạng)",
+                           "🔍  Zero-config discovery (broadcast + multicast on every interface)"),
+            ["L_Feat2"] = ("🔐  ECDHE P-256 + ECDSA + AES-256-GCM, Perfect Forward Secrecy",
+                           "🔐  ECDHE P-256 + ECDSA + AES-256-GCM, Perfect Forward Secrecy"),
+            ["L_Feat3"] = ("⏯  Truyền file tự resume khi rớt mạng, kiểm SHA-256 đầu-cuối",
+                           "⏯  File transfers auto-resume after drops, end-to-end SHA-256 check"),
+            ["L_Feat4"] = ("🖱  Kéo-thả file vào đây (hoặc Ctrl+V) để gửi", "🖱  Drag & drop (or Ctrl+V) files here to send"),
+            ["L_InputHint"] = ("Nhập tin nhắn… (Enter để gửi, Shift+Enter xuống dòng)",
+                               "Type a message… (Enter to send, Shift+Enter for a new line)"),
             ["L_Send"] = ("Gửi", "Send"),
             ["L_FileTooltip"] = ("Gửi file (bên kia sẽ được hỏi trước khi nhận)",
-                                  "Send a file (the receiver is asked before accepting)"),
-            ["L_FpTooltip"] = ("Danh tính mật mã của máy này — không thể giả mạo. Đọc cho bạn bè để họ đối chiếu.",
-                                  "This machine's cryptographic identity — cannot be forged. Read it aloud so peers can verify."),
-
-            // ---- Chuỗi động trong code ----
-            ["L_Scanning"] = ("Trạng thái: Đang quét...", "Status: Scanning..."),
-            ["L_ScanDone"] = ("Quét xong: {0} thiết bị", "Scan complete: {0} device(s)"),
-            ["L_ScanNone"] = ("Quét xong: không thấy thiết bị nào", "Scan complete: no devices found"),
-            ["L_ScanError"] = ("Lỗi quét: {0}", "Scan error: {0}"),
-            ["L_Seen"] = ("Đã thấy: {0}", "Found: {0}"),
-            ["L_TcpConnected"] = ("TCP: {0} đã kết nối", "TCP: {0} connected"),
-            ["L_TcpDisconnected"] = ("TCP: {0} đã ngắt", "TCP: {0} disconnected"),
-            ["L_Verified"] = ("Đã xác thực: {0} ({1})", "Verified: {0} ({1})"),
-            ["L_ChatWith"] = ("Chat với {0}", "Chat with {0}"),
-            ["L_ConnClosed"] = ("— Kết nối đã đóng —", "— Connection closed —"),
-            ["L_SelectFirst"] = ("Hãy chọn một thiết bị trước", "Select a device first"),
-            ["L_SendFail"] = ("— Gửi thất bại: {0} —", "— Send failed: {0} —"),
+                                 "Send files (the receiver is asked before accepting)"),
+            ["L_DropHere"] = ("Thả để gửi file", "Drop to send"),
+            ["L_SecureSub"] = ("🔒 Mã hóa đầu-cuối · ECDHE-P256 · AES-256-GCM · PFS · phiên {0}",
+                               "🔒 End-to-end encrypted · ECDHE-P256 · AES-256-GCM · PFS · session {0}"),
+            ["L_OnlineSub"] = ("Online — phiên mã hóa sẽ được thiết lập khi bạn gửi",
+                               "Online — an encrypted session is set up when you send"),
+            ["L_OfflineSub"] = ("Offline — tin nhắn sẽ được gửi khi kết nối lại được",
+                                "Offline — will try to reach it when you send"),
+            ["L_SafetyBtn"] = ("Safety number", "Safety number"),
+            ["L_SafetyTitle"] = ("Xác minh danh tính (chống kẻ đứng giữa)", "Verify identity (defeats man-in-the-middle)"),
+            ["L_SafetyBody"] = ("So dãy số này với màn hình của bên kia (gặp mặt hoặc gọi điện). Hai bên giống hệt nhau = không có ai chen giữa.",
+                                "Compare these digits with the other screen (in person or by phone). Identical on both sides = nobody is in the middle."),
+            ["L_SafetyNone"] = ("Cần kết nối với peer ít nhất một lần để có safety number.",
+                                "Connect to this peer at least once to get a safety number."),
+            ["L_MarkVerified"] = ("Đánh dấu đã xác minh", "Mark as verified"),
+            ["L_Unverify"] = ("Bỏ xác minh", "Remove verification"),
             ["L_You"] = ("Bạn", "You"),
+
+            // ---- Trạng thái / thông báo ----
+            ["L_StatusReady"] = ("Sẵn sàng", "Ready"),
+            ["L_Scanning"] = ("Đang quét mạng…", "Scanning…"),
+            ["L_ScanDone"] = ("Quét xong: {0} thiết bị online", "Scan complete: {0} device(s) online"),
+            ["L_ScanNone"] = ("Không thấy thiết bị nào — kiểm tra firewall (cho phép mạng Private) hoặc AP isolation của Wi-Fi",
+                              "No devices found — check the firewall (allow Private networks) or Wi-Fi client isolation"),
+            ["L_ScanError"] = ("Lỗi quét: {0}", "Scan error: {0}"),
+            ["L_Seen"] = ("Phát hiện: {0}", "Discovered: {0}"),
+            ["L_PeerLeft"] = ("{0} đã rời mạng", "{0} left the network"),
+            ["L_Connecting"] = ("Đang kết nối {0}…", "Connecting to {0}…"),
+            ["L_Verified"] = ("🔒 Phiên mã hóa với {0} ({1})", "🔒 Secure session with {0} ({1})"),
+            ["L_SessionLost"] = ("Mất phiên với {0}", "Session with {0} closed"),
+            ["L_ConnectFail"] = ("Kết nối thất bại: {0}", "Connection failed: {0}"),
+            ["L_SelfConnect"] = ("Đó là chính máy này", "That's this machine"),
+            ["L_SelectFirst"] = ("Hãy chọn một thiết bị trước", "Select a device first"),
+            ["L_SendFail"] = ("Gửi thất bại: {0}", "Send failed: {0}"),
             ["L_Unknown"] = ("(chưa rõ tên)", "(unknown)"),
+            ["L_NetChanged"] = ("Mạng thay đổi — đã dò lại card mạng và thông báo lại", "Network changed — interfaces re-scanned and re-announced"),
+            ["L_Rejected"] = ("Từ chối kết nối từ {0}: {1}", "Rejected connection from {0}: {1}"),
+            ["L_TamperedChat"] = ("⚠ Kết nối bị đóng: một gói tin không qua được kiểm tra toàn vẹn AES-GCM (có thể bị sửa đổi trên đường truyền).",
+                                  "⚠ Connection closed: a packet failed AES-GCM integrity check (possibly modified in transit)."),
+            ["L_IncomingFile"] = ("{0} muốn gửi file {1}", "{0} wants to send {1}"),
+            ["L_SkipFolder"] = ("Bỏ qua thư mục {0} (chỉ gửi được file)", "Skipped folder {0} (only files can be sent)"),
+            ["L_ChooseFile"] = ("Chọn file để gửi", "Choose files to send"),
+            ["L_Fatal"] = ("Lỗi không mong muốn", "Unexpected error"),
 
             // ---- Truyền file ----
-            ["L_OfferTitle"] = ("Yêu cầu gửi file", "File transfer request"),
-            ["L_OfferBody"] = ("{0} muốn gửi file:\n\n{1}  ({2} MB){3}\n\nNhận file này?",
-                                  "{0} wants to send you a file:\n\n{1}  ({2} MB){3}\n\nAccept this file?"),
-            ["L_OfferResume"] = ("\n(Đã có {0}% từ lần trước — sẽ tải tiếp)",
-                                  "\n({0}% already received — the transfer will resume)"),
-            ["L_ProgSend"] = ("Gửi", "Sending"),
-            ["L_ProgRecv"] = ("Nhận", "Receiving"),
-            ["L_SentDone"] = ("— Đã gửi xong: {0} —", "— Sent: {0} —"),
-            ["L_RecvDone"] = ("— Đã nhận file: {0} —", "— File received: {0} —"),
-            ["L_SentStatus"] = ("Gửi file hoàn tất", "File sent successfully"),
-            ["L_RecvStatus"] = ("Nhận file hoàn tất", "File received successfully"),
-            ["L_FileFail"] = ("File {0}: {1}", "File {0}: {1}"),
-            ["L_Inviting"] = ("— Đang mời {0} nhận file {1}... —", "— Inviting {0} to receive {1}... —"),
-            ["L_ChooseFile"] = ("Chọn file để gửi", "Choose a file to send"),
-            ["L_Canceled"] = ("— Đã hủy truyền file: {0} (phần dở dang được giữ để tải tiếp) —",
-                                  "— Transfer canceled: {0} (partial data kept for resume) —"),
-            ["L_CancelTooltip"] = ("Hủy truyền file — phần đã nhận vẫn giữ để tải tiếp sau",
-                                  "Cancel the transfer — received data is kept so it can resume later"),
+            ["L_Accept"] = ("Nhận", "Accept"),
+            ["L_Decline"] = ("Từ chối", "Decline"),
+            ["L_Cancel"] = ("Hủy", "Cancel"),
+            ["L_ShowFile"] = ("Mở thư mục", "Show in folder"),
+            ["L_TrTo"] = ("gửi tới {0}", "to {0}"),
+            ["L_TrFrom"] = ("từ {0}", "from {0}"),
+            ["L_TrOffering"] = ("Đang chờ {0} đồng ý…", "Waiting for {0} to accept…"),
+            ["L_TrAsk"] = ("Muốn gửi file này cho bạn", "Wants to send you this file"),
+            ["L_OfferResume"] = (" — đã có {0}%, sẽ tải tiếp", " — {0}% already here, will resume"),
+            ["L_TrPreparing"] = ("Đang kiểm tra phần đã nhận trước đó…", "Checking previously received data…"),
+            ["L_ProgSend"] = ("Đang gửi", "Sending"),
+            ["L_ProgRecv"] = ("Đang nhận", "Receiving"),
+            ["L_TrResumedFrom"] = (" · tiếp tục từ {0}%", " · resumed from {0}%"),
+            ["L_TrReconnecting"] = ("Mất kết nối — đang tự kết nối lại để tải tiếp (lần {0})…",
+                                    "Connection lost — reconnecting to resume (attempt {0})…"),
+            ["L_TrPaused"] = ("Tạm dừng — mất kết nối, sẽ tự tiếp tục khi bên gửi quay lại",
+                              "Paused — connection lost, resumes automatically when the sender is back"),
+            ["L_TrVerifying"] = ("Đang đối chiếu SHA-256…", "Verifying SHA-256…"),
+            ["L_TrDelivered"] = ("✓ Đã giao — bên nhận xác nhận SHA-256 khớp", "✓ Delivered — receiver confirmed SHA-256"),
+            ["L_TrReceived"] = ("✓ Đã nhận — SHA-256 khớp", "✓ Received — SHA-256 verified"),
+            ["L_TrRejected"] = ("Đã bị từ chối", "Declined"),
+            ["L_TrCanceled"] = ("Đã hủy (phần dở dang được giữ để tải tiếp)", "Canceled (partial data kept for resume)"),
+            ["L_TrCanceledPeer"] = ("Bên kia đã hủy", "Canceled by the other side"),
+            ["L_TrEta"] = ("còn {0}", "{0} left"),
+            ["L_ErrTimeout"] = ("Bên nhận không phản hồi", "No response from receiver"),
+            ["L_ErrIntegrity"] = ("✗ SHA-256 không khớp — dữ liệu hỏng đã bị loại bỏ", "✗ SHA-256 mismatch — corrupted data discarded"),
+            ["L_ErrDiskFull"] = ("Ổ đĩa bên nhận không đủ chỗ", "Receiver's disk is full"),
+            ["L_ErrPeerGone"] = ("Mất kết nối quá lâu — gửi lại để tải tiếp từ chỗ dừng", "Peer unreachable too long — resend to resume where it stopped"),
+            ["L_ErrBusy"] = ("File này đang được nhận ở một transfer khác", "This file is already being received"),
+            ["L_ErrIo"] = ("Lỗi: {0}", "Error: {0}"),
+            ["L_SentStatus"] = ("Đã giao {0}", "Delivered {0}"),
+            ["L_RecvStatus"] = ("Đã nhận {0}", "Received {0}"),
 
             // ---- An ninh ----
-            ["L_KeyChangedChat"] = ("⚠ CẢNH BÁO: danh tính tại {0} đã THAY ĐỔI ({1} → {2})!",
-                                     "⚠ WARNING: the identity at {0} has CHANGED ({1} → {2})!"),
+            ["L_KeyChangedChat"] = ("⚠ CẢNH BÁO: tên máy \"{0}\" trước đây thuộc danh tính {1}, nay là {2}!",
+                                    "⚠ WARNING: the name \"{0}\" used to belong to identity {1}, now it is {2}!"),
             ["L_KeyChangedTitle"] = ("Cảnh báo an ninh", "Security warning"),
-            ["L_KeyChangedBody"] = ("Danh tính mật mã tại {0} đã THAY ĐỔI!\n\nTrước: {1}\nNay:   {2}\n\n" +
-                                     "Có thể máy đó cài lại app... hoặc một máy KHÁC đang chiếm IP này.\n" +
-                                     "Hãy xác nhận với người bên kia (đọc ID cho nhau) trước khi gửi thông tin nhạy cảm.",
-                                     "The cryptographic identity at {0} has CHANGED!\n\nWas: {1}\nNow: {2}\n\n" +
-                                     "That machine may have reinstalled the app... or a DIFFERENT machine is using this IP.\n" +
-                                     "Verify with the other person (compare IDs out loud) before sending anything sensitive."),
+            ["L_KeyChangedBody"] = ("Danh tính mật mã của \"{0}\" đã THAY ĐỔI!\n\nTrước: {1}{3}\nNay:   {2}\n\n" +
+                                    "Có thể máy đó cài lại app... hoặc một máy KHÁC đang mạo danh.\n" +
+                                    "Hãy so safety number với người bên kia trước khi gửi thông tin nhạy cảm.",
+                                    "The cryptographic identity of \"{0}\" has CHANGED!\n\nWas: {1}{3}\nNow: {2}\n\n" +
+                                    "That machine may have reinstalled the app... or a DIFFERENT machine is impersonating it.\n" +
+                                    "Compare safety numbers with the other person before sending anything sensitive."),
+            ["L_WasVerified"] = ("  (đã từng được XÁC MINH!)", "  (was VERIFIED!)"),
+            ["L_NewIdentity"] = ("Lần đầu gặp danh tính này — hãy so safety number nếu cần chắc chắn",
+                                 "First time seeing this identity — compare safety numbers to be sure"),
         };
 
         /// <summary>Gọi MỘT LẦN ở đầu MainWindow, trước InitializeComponent.</summary>
@@ -108,17 +171,18 @@ namespace networkApp
                 }
             }
             catch { /* cfg hỏng → mặc định VI */ }
-            Apply(code);
+            Apply(code, persist: false);
         }
 
         public static void Toggle() => Apply(Current == VI ? EN : VI);
 
-        public static void Apply(string code)
+        public static void Apply(string code, bool persist = true)
         {
             Current = code;
             foreach (var (key, (vi, en)) in Strings)
                 Application.Current.Resources[key] = code == EN ? en : vi;
 
+            if (!persist) return;
             try
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(ConfigPath)!);
@@ -127,8 +191,11 @@ namespace networkApp
             catch { /* không lưu được cũng không sao */ }
         }
 
+        /// <summary>Chọn chuỗi động theo ngôn ngữ hiện tại (dùng cho nội dung sinh ra lúc chạy: kết quả quét, cảnh báo...).</summary>
+        public static string Pick(string vi, string en) => Current == EN ? en : vi;
+
         /// <summary>Lấy chuỗi cho code-behind: string.Format(Localization.T("key"), args...)</summary>
         public static string T(string key)
-            => Application.Current.Resources[key] as string ?? key;
+            => Application.Current?.Resources[key] as string ?? key;
     }
 }
