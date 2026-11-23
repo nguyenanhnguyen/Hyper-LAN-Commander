@@ -1,80 +1,90 @@
 using System;
 using System.Buffers.Binary;
 using System.IO;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace networkApp
 {
     /// <summary>
-    /// Loại gói tin. Thêm loại mới ở đây khi mở rộng (FileMeta, FileChunk, Resume...)
-    /// mà KHÔNG phải đụng vào logic đọc/ghi khung.
+    /// Loại RECORD trên dây (lớp ngoài cùng). Chỉ có 2 loại:
+    /// - Hello  : gói bắt tay DUY NHẤT ở dạng rõ (public key, nonce...)
+    /// - Sealed : mọi thứ còn lại — AES-256-GCM. Loại gói thật (Text, FileChunk...)
+    ///            nằm BÊN TRONG ciphertext, nên kẻ nghe lén không phân biệt được
+    ///            chat với file, ping với chữ ký (giống TLS 1.3 ẩn content-type).
+    /// </summary>
+    public enum RecordType : byte
+    {
+        Hello = 0x48,   // 'H'
+        Sealed = 0x53,  // 'S'
+    }
+
+    /// <summary>
+    /// Loại gói BÊN TRONG record Sealed. Thêm loại mới ở đây khi mở rộng
+    /// mà KHÔNG phải đụng vào logic đóng khung / mã hóa.
     /// </summary>
     public enum PacketType : byte
     {
-        Text = 0x01,
-        Handshake = 0x02, // trao public key + salt — gói DUY NHẤT không mã hóa
+        Auth = 0x01,     // chữ ký ECDSA lên transcript bắt tay — luôn là gói Sealed đầu tiên
+        Text = 0x02,
+        Ping = 0x03,     // heartbeat + đo RTT
+        Pong = 0x04,
+        Bye = 0x05,      // đóng phiên êm (graceful) — bên kia biết ngay, không phải chờ timeout
 
-        // Luồng file CONSENT-FIRST: không byte dữ liệu nào được gửi
-        // trước khi bên nhận chủ động Accept.
-        FileOffer = 0x10, // "Tôi muốn gửi file X, size Y" (JSON)
-        FileAccept = 0x11, // "Đồng ý, gửi từ offset Z"  ← Z>0 = RESUME
-        FileReject = 0x12, // "Từ chối"
-        FileChunk = 0x13, // [16B transferId][dữ liệu]
-        FileComplete = 0x14, // "Hết file"
-        FileCancel = 0x15, // Một trong hai bên chủ động hủy giữa chừng (giữ .part để resume)
+        // Luồng file CONSENT-FIRST: không byte dữ liệu nào được gửi trước khi bên nhận Accept.
+        FileOffer = 0x10,    // {id, tên, size, contentKey, resume}
+        FileAccept = 0x11,   // {id, offset} — offset>0 = RESUME; gửi lại giữa chừng = yêu cầu tua (resync)
+        FileReject = 0x12,   // [16B id][1B lý do]
+        FileChunk = 0x13,    // [16B id][8B offset][dữ liệu]
+        FileComplete = 0x14, // [16B id][32B SHA-256 toàn file]
+        FileCancel = 0x15,   // hủy giữa chừng (giữ .part để resume)
+        FileResult = 0x16,   // [16B id][1B status] — bên nhận xác nhận đã kiểm SHA-256
     }
 
     /// <summary>
     /// Giao thức khung nhị phân (length-prefixed framing) trên TCP:
     ///
-    ///   [4 byte LE: độ dài payload][1 byte: PacketType][payload]
+    ///   [1B RecordType][4B LE: độ dài body][body]
     ///
-    /// Vì TCP là STREAM (không có ranh giới message), bên nhận phải tự biết
-    /// mỗi "gói" dài bao nhiêu — đó là vai trò của 4 byte đầu. Đây là dạng
-    /// serialization nhị phân + buffer management cơ bản nhất và nhanh nhất.
+    /// TCP là STREAM (không có ranh giới message) nên bên nhận phải biết mỗi
+    /// record dài bao nhiêu. Với record Sealed, 5 byte header này còn được đưa vào
+    /// AAD của AES-GCM → sửa độ dài hay loại record trên đường truyền đều bị phát hiện.
     /// </summary>
     public static class Protocol
     {
-        private const int HeaderSize = 5;
-        private const int MaxPayload = 16 * 1024 * 1024; // 16MB — chặn gói rác/độc làm cạn RAM
+        public const string Magic = "HLC";
+        public const int Version = 2;
 
-        public static async Task WriteFrameAsync(
-            Stream stream, PacketType type, ReadOnlyMemory<byte> payload, CancellationToken ct)
+        public const int HeaderSize = 5;
+        public const int TagSize = 16;
+        public const int MaxHelloSize = 4 * 1024;          // trước khi xác thực: không cho cấp phát lớn
+        public const int MaxRecordSize = 4 * 1024 * 1024;  // chunk 128KB + overhead — 4MB là dư dả
+
+        public static void WriteHeader(Span<byte> dst, RecordType type, int bodyLength)
         {
-            byte[] header = new byte[HeaderSize];
-            BinaryPrimitives.WriteInt32LittleEndian(header, payload.Length);
-            header[4] = (byte)type;
-
-            await stream.WriteAsync(header, ct);
-            await stream.WriteAsync(payload, ct);
-            await stream.FlushAsync(ct);
+            dst[0] = (byte)type;
+            BinaryPrimitives.WriteInt32LittleEndian(dst.Slice(1, 4), bodyLength);
         }
-
-        public static Task WriteTextAsync(Stream stream, string text, CancellationToken ct)
-            => WriteFrameAsync(stream, PacketType.Text, Encoding.UTF8.GetBytes(text), ct);
 
         /// <summary>
-        /// Đọc đúng MỘT khung. ReadExactlyAsync đảm bảo đọc đủ N byte
-        /// (TCP có thể trả dữ liệu vụn từng mẩu — "partial read").
-        /// Ném EndOfStreamException khi bên kia đóng kết nối.
+        /// Đọc đúng 5 byte header. ReadExactlyAsync xử lý "partial read" (TCP có thể
+        /// trả dữ liệu vụn từng mẩu). Ném EndOfStreamException khi bên kia đóng kết nối.
         /// </summary>
-        public static async Task<(PacketType Type, byte[] Payload)> ReadFrameAsync(
-            Stream stream, CancellationToken ct)
+        public static async ValueTask<(RecordType Type, int Length)> ReadHeaderAsync(
+            Stream stream, Memory<byte> header, CancellationToken ct)
         {
-            byte[] header = new byte[HeaderSize];
-            await stream.ReadExactlyAsync(header, ct);
-
-            int length = BinaryPrimitives.ReadInt32LittleEndian(header);
-            var type = (PacketType)header[4];
-
-            if (length < 0 || length > MaxPayload)
-                throw new InvalidDataException($"Kích thước gói bất thường: {length}");
-
-            byte[] payload = new byte[length];
-            await stream.ReadExactlyAsync(payload, ct);
-            return (type, payload);
+            await stream.ReadExactlyAsync(header[..HeaderSize], ct).ConfigureAwait(false);
+            var type = (RecordType)header.Span[0];
+            int length = BinaryPrimitives.ReadInt32LittleEndian(header.Span.Slice(1, 4));
+            if (length < 0 || length > MaxRecordSize)
+                throw new HlcProtocolException($"Kích thước record bất thường: {length}");
+            return (type, length);
         }
+    }
+
+    /// <summary>Bên kia vi phạm giao thức (gói lạ, sai thứ tự, sai kích thước...) → đóng kết nối.</summary>
+    public sealed class HlcProtocolException : IOException
+    {
+        public HlcProtocolException(string message) : base(message) { }
     }
 }

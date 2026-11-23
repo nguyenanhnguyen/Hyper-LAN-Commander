@@ -1,5 +1,10 @@
 using System;
+using System.Buffers;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
@@ -10,252 +15,949 @@ using System.Threading.Tasks;
 
 namespace networkApp
 {
+    /// <summary>Thông tin một phiên đã XÁC THỰC với một peer.</summary>
+    public sealed record PeerSessionInfo(
+        string Fingerprint,
+        string Name,
+        byte[] PublicKey,
+        IPEndPoint RemoteEndPoint,
+        int ListenPort,
+        string SessionId,
+        bool IsInitiator,
+        Guid Instance)
+    {
+        public IPEndPoint ListenEndPoint => new(RemoteEndPoint.Address, ListenPort);
+    }
+
+    public enum CloseReason { Closed, PeerLeft, Timeout, NetworkError, Tampered, ProtocolError, AuthFailed, Replaced, SelfConnection, Shutdown }
+
+    /// <summary>Không có/mất đường tới peer. Là IOException → tầng trên coi là lỗi mạng tạm thời.</summary>
+    public sealed class PeerUnavailableException : IOException
+    {
+        public CloseReason Reason { get; }
+        public PeerUnavailableException(string message, CloseReason reason = CloseReason.NetworkError)
+            : base(message) => Reason = reason;
+    }
+
     /// <summary>
-    /// TCP messaging đa kết nối, MÃ HÓA ĐẦU-CUỐI.
+    /// TCP messaging đa kết nối, MÃ HÓA ĐẦU-CUỐI, định danh theo DANH TÍNH (fingerprint).
     ///
-    /// ĐỊNH DANH PEER = "ip:port" (endpoint) thay vì chỉ IP.
-    /// Nhờ vậy nhiều instance CÙNG IP (loopback test trên 1 máy) vẫn phân biệt
-    /// được nhau. Cổng lắng nghe của mỗi bên được mang trong gói Handshake,
-    /// nên bên nhận biết được cổng THẬT của bên kia (không phải cổng nguồn tạm).
-    ///
-    /// Cổng lắng nghe đọc từ biến môi trường HLC_PORT (mặc định 8889) — đặt
-    /// HLC_PORT=8890 cho instance thứ 2 khi test trên cùng máy.
+    /// • Peer được gọi bằng fingerprint, không phải ip:port. Peer đổi IP (DHCP, đổi Wi-Fi)
+    ///   vẫn là cùng một người: lịch sử chat và transfer đang dở đi theo danh tính.
+    /// • "Sổ địa chỉ" mỗi peer (từ discovery + phiên trước) → tự kết nối lại khi cần gửi.
+    ///   Có nhiều địa chỉ thì đua kết nối song song kiểu Happy Eyeballs (RFC 8305).
+    /// • Mỗi kết nối có MỘT writer loop với 2 hàng đợi ưu tiên: điều khiển (chat, ping,
+    ///   offer...) luôn chen trước dữ liệu khối (chunk file) — chat vẫn tức thì khi đang
+    ///   đẩy file GB, giống stream priority của HTTP/2. Hàng bulk có giới hạn → backpressure.
+    /// • Heartbeat 3s + TCP keepalive: peer rút dây mạng bị phát hiện trong ~12s thay vì treo vô hạn.
+    /// • Hai bên kết nối cho nhau CÙNG LÚC → quy tắc tie-break tất định giữ đúng 1 kết nối.
     /// </summary>
-    public class MessagingService : IDisposable
+    public sealed class MessagingService : IDisposable
     {
         public const int DefaultPort = 8889;
-        private static readonly TimeSpan HandshakeTimeout = TimeSpan.FromSeconds(5);
 
-        public int ListenPort { get; }
-
-        private sealed class Peer
-        {
-            public required TcpClient Client { get; init; }
-            public required NetworkStream Stream { get; init; }
-            public SemaphoreSlim WriteLock { get; } = new(1, 1);
-
-            public string? Key;                 // "ip:port" — null cho tới khi handshake xong (kết nối đến)
-            public byte[] MySalt { get; } = RandomNumberGenerator.GetBytes(16);
-            public byte[]? SessionKey;
-            public string? Fingerprint;
-            public string? RemoteName;
-            public TaskCompletionSource Ready { get; } =
-                new(TaskCreationOptions.RunContinuationsAsynchronously);
-        }
-
-        private record HandshakeMsg(byte[] PublicKey, byte[] Salt, string Name, int ListenPort);
+        private static readonly TimeSpan HandshakeTimeout = TimeSpan.FromSeconds(6);
+        private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(3);
+        private static readonly TimeSpan HappyEyeballsDelay = TimeSpan.FromMilliseconds(250);
+        private const int PingIntervalMs = 3000;
+        private const int DeadAfterMs = 12000;
+        private const int BulkQueueDepth = 8;
+        private const int MaxConnections = 64;
+        private const int MaxTextBytes = 64 * 1024;
 
         private readonly CryptoService _crypto;
-        private readonly TcpListener _listener;
-        private readonly ConcurrentDictionary<string, Peer> _peers = new();
-        private readonly ConcurrentDictionary<string, string> _seenFingerprints = new();
+        private readonly string _localName;
+        private readonly int _preferredPort;
+        private TcpListener? _listener;
         private readonly CancellationTokenSource _cts = new();
 
-        public event Action<string, string>? OnTextReceived;
-        public event Action<string>? OnPeerConnected;
-        public event Action<string>? OnPeerDisconnected;
-        public event Action<string, PacketType, byte[]>? OnFrameReceived;
-        public event Action<string, string, string>? OnPeerIdentified;   // key, fingerprint, name
-        public event Action<string, string, string>? OnKeyChanged;       // key, oldFp, newFp
+        private readonly object _sessionLock = new();
+        private readonly Dictionary<string, Connection> _sessions = new();      // fp → kết nối đang dùng
+        private readonly ConcurrentDictionary<long, Connection> _all = new();   // mọi kết nối (kể cả đang bắt tay)
+        private readonly ConcurrentDictionary<string, EndpointBook> _books = new();
+        private readonly object _dialLock = new();
+        private readonly Dictionary<string, Task<Connection>> _dialing = new();
+        private long _nextConnId;
+        private long _bytesSent, _bytesReceived;
 
-        public MessagingService(CryptoService crypto)
+        public Guid InstanceId { get; } = Guid.NewGuid();
+        public int ListenPort { get; private set; }
+        public string LocalFingerprint => _crypto.Fingerprint;
+        public long BytesSent => Interlocked.Read(ref _bytesSent);
+        public long BytesReceived => Interlocked.Read(ref _bytesReceived);
+        public int SessionCount { get { lock (_sessionLock) return _sessions.Count; } }
+
+        // ---------- Events (bắn trên thread nền — UI tự marshal) ----------
+        public event Action<PeerSessionInfo>? SessionEstablished;
+        public event Action<string, CloseReason>? SessionLost;              // fp, lý do
+        public event Action<string, int>? RttUpdated;                       // fp, ms
+        public event Action<string, string>? TextReceived;                  // fp, text
+        public event Action<string, CloseReason, string>? ConnectionRejected; // endpoint, lý do, chi tiết
+
+        /// <summary>Handler cho các gói không phải chat/điều khiển (file...). Được AWAIT trong
+        /// vòng đọc → tự tạo backpressure. Payload chỉ hợp lệ trong lúc gọi (buffer được tái sử dụng).
+        /// KHÔNG được await việc GỬI bên trong handler (dùng fire-and-forget) để tránh deadlock.</summary>
+        public Func<string, PacketType, ReadOnlyMemory<byte>, ValueTask>? FrameHandler { get; set; }
+
+        public MessagingService(CryptoService crypto, string localName, int preferredPort = DefaultPort)
         {
             _crypto = crypto;
-            ListenPort = int.TryParse(Environment.GetEnvironmentVariable("HLC_PORT"), out int p)
-                ? p : DefaultPort;
-            _listener = new TcpListener(IPAddress.Any, ListenPort);
+            _localName = localName.Length > 64 ? localName[..64] : localName;
+            _preferredPort = preferredPort;
         }
 
-        public void StartListening()
+        // =====================================================================
+        //  LISTENER
+        // =====================================================================
+
+        public void Start()
         {
-            _listener.Start();
-            _ = Task.Run(async () =>
+            _listener = CreateListener(_preferredPort, out int port);
+            ListenPort = port;
+            _ = Task.Run(AcceptLoopAsync);
+        }
+
+        /// <summary>
+        /// Socket dual-stack (IPv6 + IPv4-mapped) nếu hệ thống hỗ trợ. Cổng bị chiếm
+        /// (instance khác đang chạy) → thử các cổng kế tiếp; discovery sẽ quảng bá cổng THẬT.
+        /// </summary>
+        private static TcpListener CreateListener(int preferred, out int actualPort)
+        {
+            var candidates = Enumerable.Range(preferred, 12).Where(p => p < 65536).Append(0);
+            foreach (int port in candidates)
             {
-                while (!_cts.IsCancellationRequested)
+                foreach (bool dual in new[] { true, false })
                 {
+                    if (dual && !Socket.OSSupportsIPv6) continue;
+                    TcpListener? l = null;
                     try
                     {
-                        TcpClient client = await _listener.AcceptTcpClientAsync(_cts.Token);
-                        // Kết nối ĐẾN: chưa biết cổng lắng nghe của họ → chờ handshake mới có key
-                        var peer = MakePeer(client);
-                        _ = Task.Run(() => ReceiveLoopAsync(peer));
-                        _ = Task.Run(() => SendHandshakeAsync(peer));
+                        l = dual ? new TcpListener(IPAddress.IPv6Any, port) : new TcpListener(IPAddress.Any, port);
+                        if (dual) l.Server.DualMode = true;
+                        l.Server.ExclusiveAddressUse = true;
+                        l.Start(backlog: 64);
+                        actualPort = ((IPEndPoint)l.LocalEndpoint).Port;
+                        return l;
                     }
-                    catch (OperationCanceledException) { break; }
-                    catch (Exception ex)
+                    catch (SocketException)
                     {
-                        System.Diagnostics.Debug.WriteLine($"[TCP accept] {ex.Message}");
+                        l?.Stop();
                     }
                 }
-            });
+            }
+            throw new IOException("Không mở được cổng TCP nào để lắng nghe");
         }
 
-        public Task SendTextAsync(string key, string text)
-            => SendFrameAsync(key, PacketType.Text, Encoding.UTF8.GetBytes(text));
-
-        public async Task SendFrameAsync(string key, PacketType type, ReadOnlyMemory<byte> payload)
+        private async Task AcceptLoopAsync()
         {
-            Peer peer = await GetOrConnectAsync(key);
-            await peer.Ready.Task.WaitAsync(HandshakeTimeout, _cts.Token);
+            while (!_cts.IsCancellationRequested)
+            {
+                try
+                {
+                    TcpClient client = await _listener!.AcceptTcpClientAsync(_cts.Token).ConfigureAwait(false);
+                    if (_all.Count >= MaxConnections) { client.Dispose(); continue; } // chống tràn kết nối
+                    StartConnection(client, isInitiator: false);
+                }
+                catch (OperationCanceledException) { break; }
+                catch (ObjectDisposedException) { break; }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[TCP accept] {ex.Message}");
+                    try { await Task.Delay(200, _cts.Token).ConfigureAwait(false); } catch { break; }
+                }
+            }
+        }
 
-            byte[] encrypted = CryptoService.Encrypt(peer.SessionKey!, payload.Span);
+        // =====================================================================
+        //  SỔ ĐỊA CHỈ (fingerprint → các endpoint đã biết)
+        // =====================================================================
 
-            await peer.WriteLock.WaitAsync(_cts.Token);
+        private sealed class EndpointBook
+        {
+            private readonly Dictionary<IPEndPoint, DateTime> _eps = new();
+            public void Add(IPEndPoint ep) { lock (_eps) _eps[ep] = DateTime.UtcNow; }
+            public void Remove(IPEndPoint ep) { lock (_eps) _eps.Remove(ep); }
+            public List<IPEndPoint> Snapshot()
+            {
+                lock (_eps)
+                {
+                    foreach (var old in _eps.Where(kv => DateTime.UtcNow - kv.Value > TimeSpan.FromHours(12))
+                                            .Select(kv => kv.Key).ToList())
+                        _eps.Remove(old);
+                    return _eps.OrderByDescending(kv => kv.Value).Select(kv => kv.Key).Take(6).ToList();
+                }
+            }
+        }
+
+        /// <summary>Thêm một đường tới peer (từ discovery, từ phiên cũ, từ danh bạ).</summary>
+        public void AddEndpoint(string fingerprint, IPEndPoint endpoint)
+        {
+            if (fingerprint == _crypto.Fingerprint) return;
+            _books.GetOrAdd(fingerprint, _ => new EndpointBook()).Add(Normalize(endpoint));
+        }
+
+        public bool IsConnected(string fingerprint) => GetActive(fingerprint) is not null;
+
+        public PeerSessionInfo? GetSession(string fingerprint) => GetActive(fingerprint)?.Info;
+
+        public int GetRtt(string fingerprint) => GetActive(fingerprint)?.RttMs ?? -1;
+
+        private Connection? GetActive(string fp)
+        {
+            lock (_sessionLock)
+                return _sessions.TryGetValue(fp, out var c) && c.AcceptsWrites ? c : null;
+        }
+
+        // =====================================================================
+        //  API GỬI
+        // =====================================================================
+
+        public Task SendTextAsync(string fingerprint, string text, CancellationToken ct = default)
+        {
+            byte[] data = Encoding.UTF8.GetBytes(text);
+            if (data.Length > MaxTextBytes) throw new ArgumentException("Tin nhắn quá dài");
+            return SendAsync(fingerprint, PacketType.Text, data, ct);
+        }
+
+        /// <summary>Gửi gói ĐIỀU KHIỂN (ưu tiên cao). Hoàn tất khi gói đã được ghi xuống socket.
+        /// Tự kết nối (lại) nếu chưa có phiên.</summary>
+        public async Task SendAsync(string fingerprint, PacketType type, ReadOnlyMemory<byte> payload,
+                                    CancellationToken ct = default)
+        {
+            byte[] copy = payload.ToArray();
+            for (int attempt = 0; ; attempt++)
+            {
+                Connection conn = await GetSessionAsync(fingerprint, ct).ConfigureAwait(false);
+                var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                if (!TryEnqueueHigh(conn, new OutFrame(type, copy, 0, copy.Length, false, done)))
+                {
+                    if (attempt < 3) continue; // phiên vừa bị thay thế → lấy phiên mới
+                    throw new PeerUnavailableException("Phiên đã đóng");
+                }
+                await done.Task.WaitAsync(ct).ConfigureAwait(false);
+                return;
+            }
+        }
+
+        /// <summary>
+        /// Gửi gói DỮ LIỆU KHỐI (chunk file). NHẬN QUYỀN SỞ HỮU <paramref name="pooledBuffer"/>
+        /// (thuê từ ArrayPool) — writer loop trả lại pool sau khi ghi. Chờ khi hàng bulk đầy
+        /// (backpressure) nên bên gửi không bao giờ đọc file nhanh hơn mạng chuyển được.
+        /// </summary>
+        public async ValueTask SendBulkAsync(string fingerprint, PacketType type, byte[] pooledBuffer, int count,
+                                             CancellationToken ct = default)
+        {
+            bool owned = true;
             try
             {
-                await Protocol.WriteFrameAsync(peer.Stream, type, encrypted, _cts.Token);
+                for (int attempt = 0; ; attempt++)
+                {
+                    Connection conn = await GetSessionAsync(fingerprint, ct).ConfigureAwait(false);
+                    ct.ThrowIfCancellationRequested();
+                    if (await TryEnqueueBulkAsync(conn, new OutFrame(type, pooledBuffer, 0, count, true, null))
+                            .ConfigureAwait(false))
+                    {
+                        owned = false;
+                        return;
+                    }
+                    if (attempt >= 3) throw new PeerUnavailableException("Phiên đã đóng");
+                }
+            }
+            finally
+            {
+                if (owned) ArrayPool<byte>.Shared.Return(pooledBuffer);
+            }
+        }
+
+        /// <summary>Kết nối thủ công tới host:port. Trả về phiên đã xác thực.</summary>
+        public async Task<PeerSessionInfo> ConnectAsync(string host, int port, CancellationToken ct = default)
+        {
+            IPAddress[] addrs = IPAddress.TryParse(host, out IPAddress? ip)
+                ? new[] { ip }
+                : await Dns.GetHostAddressesAsync(host, ct).ConfigureAwait(false);
+            var eps = addrs.Where(a => a.AddressFamily == AddressFamily.InterNetwork ||
+                                       (a.AddressFamily == AddressFamily.InterNetworkV6 && Socket.OSSupportsIPv6))
+                           .Select(a => new IPEndPoint(a, port)).ToList();
+            if (eps.Count == 0) throw new PeerUnavailableException($"Không phân giải được {host}");
+
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, _cts.Token);
+            TcpClient client = await RaceConnectAsync(eps, linked.Token).ConfigureAwait(false);
+            Connection conn = StartConnection(client, isInitiator: true);
+            return await conn.Authenticated.Task.WaitAsync(HandshakeTimeout, linked.Token).ConfigureAwait(false);
+        }
+
+        // =====================================================================
+        //  QUAY SỐ (dial) — single-flight + Happy Eyeballs
+        // =====================================================================
+
+        private async Task<Connection> GetSessionAsync(string fp, CancellationToken ct)
+        {
+            if (GetActive(fp) is { } active) return active;
+
+            Task<Connection> dial;
+            lock (_dialLock)
+            {
+                if (!_dialing.TryGetValue(fp, out dial!))
+                {
+                    // Task.Run: đảm bảo task được đăng ký vào _dialing TRƯỚC khi có thể hoàn tất
+                    dial = Task.Run(() => DialAsync(fp));
+                    _dialing[fp] = dial;
+                }
+            }
+            return await dial.WaitAsync(ct).ConfigureAwait(false);
+        }
+
+        private async Task<Connection> DialAsync(string fp)
+        {
+            try
+            {
+                if (GetActive(fp) is { } active) return active; // phiên vừa được bên kia mở tới
+
+                var book = _books.TryGetValue(fp, out var b) ? b.Snapshot() : new List<IPEndPoint>();
+                if (book.Count == 0)
+                    throw new PeerUnavailableException("Chưa biết địa chỉ của peer này (offline?)");
+
+                var remaining = book.ToList();
+                while (remaining.Count > 0)
+                {
+                    TcpClient client = await RaceConnectAsync(remaining, _cts.Token).ConfigureAwait(false);
+                    var ep = Normalize((IPEndPoint)client.Client.RemoteEndPoint!);
+                    remaining.RemoveAll(e => e.Equals(ep));
+
+                    Connection conn = StartConnection(client, isInitiator: true);
+                    PeerSessionInfo info;
+                    try
+                    {
+                        info = await conn.Authenticated.Task.WaitAsync(HandshakeTimeout, _cts.Token)
+                                         .ConfigureAwait(false);
+                    }
+                    catch (Exception) when (remaining.Count > 0) { continue; }
+
+                    if (info.Fingerprint != fp)
+                    {
+                        // Địa chỉ này giờ là của một danh tính KHÁC (IP bị tái cấp phát, hoặc gói
+                        // discovery giả mạo) — phiên kia vẫn hợp lệ, nhưng không phải người ta cần.
+                        if (_books.TryGetValue(fp, out var bk)) bk.Remove(ep);
+                        continue;
+                    }
+                    return GetActive(fp) ?? conn;
+                }
+                throw new PeerUnavailableException("Không địa chỉ nào của peer phản hồi");
+            }
+            finally
+            {
+                lock (_dialLock) _dialing.Remove(fp);
+            }
+        }
+
+        /// <summary>
+        /// Happy Eyeballs (RFC 8305): thử endpoint đầu tiên, cứ mỗi 250ms chưa xong lại mở
+        /// thêm một hướng song song. Ai bắt tay TCP xong trước thắng, các hướng khác bị hủy.
+        /// Peer có cả Wi-Fi lẫn Ethernet (hoặc một IP đã chết) vẫn kết nối gần như tức thì.
+        /// </summary>
+        private static async Task<TcpClient> RaceConnectAsync(IReadOnlyList<IPEndPoint> endpoints, CancellationToken ct)
+        {
+            using var race = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            var attempts = new List<Task<TcpClient>>();
+            Exception? last = null;
+
+            for (int i = 0; i < endpoints.Count; i++)
+                attempts.Add(AttemptAsync(endpoints[i], HappyEyeballsDelay * i, race.Token));
+
+            while (attempts.Count > 0)
+            {
+                Task<TcpClient> done = await Task.WhenAny(attempts).ConfigureAwait(false);
+                attempts.Remove(done);
+                if (done.IsCompletedSuccessfully)
+                {
+                    race.Cancel();
+                    foreach (var loser in attempts)
+                        _ = loser.ContinueWith(t => { if (t.IsCompletedSuccessfully) t.Result.Dispose(); },
+                                               TaskScheduler.Default);
+                    return done.Result;
+                }
+                last = done.Exception?.InnerException ?? last;
+            }
+            ct.ThrowIfCancellationRequested();
+            throw new PeerUnavailableException($"Không kết nối được: {last?.Message}");
+        }
+
+        private static async Task<TcpClient> AttemptAsync(IPEndPoint ep, TimeSpan delay, CancellationToken ct)
+        {
+            if (delay > TimeSpan.Zero) await Task.Delay(delay, ct).ConfigureAwait(false);
+            var client = new TcpClient(ep.AddressFamily);
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(ConnectTimeout);
+            try
+            {
+                await client.ConnectAsync(ep, timeout.Token).ConfigureAwait(false);
+                return client;
             }
             catch
             {
-                RemovePeer(peer.Key);
+                client.Dispose();
+                throw;
+            }
+        }
+
+        // =====================================================================
+        //  KẾT NỐI
+        // =====================================================================
+
+        private readonly record struct OutFrame(PacketType Type, byte[] Buffer, int Offset, int Count,
+                                                bool ReturnToPool, TaskCompletionSource? Done);
+
+        private sealed class Connection
+        {
+            public required long Id { get; init; }
+            public required TcpClient Client { get; init; }
+            public required NetworkStream Stream { get; init; }
+            public required bool IsInitiator { get; init; }
+            public required IPEndPoint Remote { get; init; }
+            public required byte[] MyHello { get; init; }
+            public required ECDiffieHellman Ephemeral { get; init; }
+
+            public readonly CancellationTokenSource Cts = new();
+            public readonly TaskCompletionSource KeysReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            public readonly TaskCompletionSource<PeerSessionInfo> Authenticated =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            // Hàng đợi ưu tiên 2 mức: _items đếm tổng số gói, _bulkSlots giới hạn hàng bulk
+            public readonly ConcurrentQueue<OutFrame> High = new();
+            public readonly ConcurrentQueue<OutFrame> Bulk = new();
+            public readonly SemaphoreSlim Items = new(0);
+            public readonly SemaphoreSlim BulkSlots = new(BulkQueueDepth);
+
+            public CipherState? Tx, Rx;
+            public byte[]? Transcript;
+            public HelloMsg? PeerHello;
+            public string? Fingerprint;
+            public PeerSessionInfo? Info;
+            public Task? WriterTask;
+
+            public long LastRxTick = Environment.TickCount64;
+            public volatile int RttMs = -1;
+            public volatile bool Draining;   // đang đóng êm: không nhận gói mới
+            public int ClosedFlag;
+            public CloseReason Reason = CloseReason.Closed;
+
+            public bool IsClosed => Volatile.Read(ref ClosedFlag) == 1;
+            public bool AcceptsWrites => !IsClosed && !Draining && Authenticated.Task.IsCompletedSuccessfully;
+        }
+
+        private Connection StartConnection(TcpClient client, bool isInitiator)
+        {
+            ConfigureSocket(client.Client);
+            var eph = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
+            var hello = new HelloMsg(Protocol.Magic, Protocol.Version, _crypto.PublicKey,
+                eph.ExportSubjectPublicKeyInfo(), RandomNumberGenerator.GetBytes(Handshake.NonceSize),
+                _localName, ListenPort, InstanceId);
+
+            var conn = new Connection
+            {
+                Id = Interlocked.Increment(ref _nextConnId),
+                Client = client,
+                Stream = client.GetStream(),
+                IsInitiator = isInitiator,
+                Remote = Normalize((IPEndPoint)client.Client.RemoteEndPoint!),
+                MyHello = JsonSerializer.SerializeToUtf8Bytes(hello),
+                Ephemeral = eph,
+            };
+            _all[conn.Id] = conn;
+            _ = conn.Authenticated.Task.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+
+            conn.WriterTask = Task.Run(() => WriterLoopAsync(conn));
+            _ = Task.Run(() => ReaderLoopAsync(conn));
+            _ = Task.Run(() => HeartbeatLoopAsync(conn));
+            return conn;
+        }
+
+        private static void ConfigureSocket(Socket s)
+        {
+            s.NoDelay = true; // tắt Nagle: chat/ping không bị gom chờ 200ms
+            try
+            {
+                // TCP keepalive ở tầng OS: phát hiện peer biến mất cả khi app không gửi gì
+                s.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                s.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 15);
+                s.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 3);
+                s.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3);
+            }
+            catch (SocketException) { /* OS cũ — heartbeat tầng app vẫn lo được */ }
+        }
+
+        private static IPEndPoint Normalize(IPEndPoint ep)
+            => ep.Address.IsIPv4MappedToIPv6 ? new IPEndPoint(ep.Address.MapToIPv4(), ep.Port) : ep;
+
+        // ---------------- Hàng đợi ----------------
+
+        private static bool TryEnqueueHigh(Connection c, OutFrame f, bool allowBeforeAuth = false)
+        {
+            if (c.IsClosed || c.Draining || (!allowBeforeAuth && !c.Authenticated.Task.IsCompletedSuccessfully))
+                return false;
+            c.High.Enqueue(f);
+            c.Items.Release();
+            if (c.IsClosed) DrainQueues(c); // đóng đúng lúc vừa enqueue → không để gói nào treo
+            return true;
+        }
+
+        private static async ValueTask<bool> TryEnqueueBulkAsync(Connection c, OutFrame f)
+        {
+            if (!c.AcceptsWrites) return false;
+            try { await c.BulkSlots.WaitAsync(c.Cts.Token).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return false; }
+            if (!c.AcceptsWrites) { c.BulkSlots.Release(); return false; }
+            c.Bulk.Enqueue(f);
+            c.Items.Release();
+            if (c.IsClosed) DrainQueues(c);
+            return true;
+        }
+
+        private static void DrainQueues(Connection c)
+        {
+            var ex = new PeerUnavailableException("Kết nối đã đóng", c.Reason);
+            while (c.High.TryDequeue(out var f)) Fail(f, ex);
+            while (c.Bulk.TryDequeue(out var f)) Fail(f, ex);
+
+            static void Fail(OutFrame f, Exception ex)
+            {
+                f.Done?.TrySetException(ex);
+                if (f.ReturnToPool) ArrayPool<byte>.Shared.Return(f.Buffer);
+            }
+        }
+
+        // ---------------- Writer loop ----------------
+
+        private async Task WriterLoopAsync(Connection c)
+        {
+            CancellationToken ct = c.Cts.Token;
+            try
+            {
+                // 1) Hello dạng rõ — gửi ngay, KHÔNG chờ bên kia (bắt tay song song, 1-RTT)
+                byte[] hello = new byte[Protocol.HeaderSize + c.MyHello.Length];
+                Protocol.WriteHeader(hello, RecordType.Hello, c.MyHello.Length);
+                c.MyHello.CopyTo(hello, Protocol.HeaderSize);
+                await c.Stream.WriteAsync(hello, ct).ConfigureAwait(false);
+                Interlocked.Add(ref _bytesSent, hello.Length);
+
+                // 2) Chờ có khóa phiên, sau đó mọi thứ đều Sealed
+                await c.KeysReady.Task.WaitAsync(ct).ConfigureAwait(false);
+
+                while (true)
+                {
+                    await c.Items.WaitAsync(ct).ConfigureAwait(false);
+                    OutFrame f;
+                    if (c.High.TryDequeue(out f)) { }
+                    else if (c.Bulk.TryDequeue(out f)) c.BulkSlots.Release();
+                    else
+                    {
+                        if (!c.Draining) continue;
+                        // Hết hàng + đang đóng êm → gửi Bye, đóng chiều ghi (FIN), để reader nhận nốt
+                        await WriteSealedAsync(c, new OutFrame(PacketType.Bye, Array.Empty<byte>(), 0, 0, false, null), ct)
+                            .ConfigureAwait(false);
+                        try { c.Client.Client.Shutdown(SocketShutdown.Send); } catch { }
+                        return;
+                    }
+                    await WriteSealedAsync(c, f, ct).ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                Close(c, c.Draining ? CloseReason.Closed : ClassifyIo(ex));
+            }
+            finally
+            {
+                DrainQueues(c);
+                c.Tx?.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// [1B 'S'][4B len][ AES-GCM( 1B PacketType ‖ payload ) ][16B tag]
+        /// Mã hóa tại chỗ trong MỘT buffer thuê từ pool → một lần WriteAsync = một lời gọi hệ thống.
+        /// </summary>
+        private async ValueTask WriteSealedAsync(Connection c, OutFrame f, CancellationToken ct)
+        {
+            int plainLen = 1 + f.Count;
+            int bodyLen = plainLen + Protocol.TagSize;
+            int total = Protocol.HeaderSize + bodyLen;
+            byte[] buf = ArrayPool<byte>.Shared.Rent(total);
+            try
+            {
+                Protocol.WriteHeader(buf, RecordType.Sealed, bodyLen);
+                buf[Protocol.HeaderSize] = (byte)f.Type;
+                f.Buffer.AsSpan(f.Offset, f.Count).CopyTo(buf.AsSpan(Protocol.HeaderSize + 1));
+                c.Tx!.SealInPlace(buf.AsSpan(Protocol.HeaderSize, plainLen),
+                                  buf.AsSpan(Protocol.HeaderSize + plainLen, Protocol.TagSize),
+                                  buf.AsSpan(0, Protocol.HeaderSize)); // AAD = header
+                await c.Stream.WriteAsync(buf.AsMemory(0, total), ct).ConfigureAwait(false);
+                Interlocked.Add(ref _bytesSent, total);
+                f.Done?.TrySetResult();
+            }
+            catch (Exception ex)
+            {
+                f.Done?.TrySetException(new PeerUnavailableException(ex.Message));
                 throw;
             }
             finally
             {
-                peer.WriteLock.Release();
+                ArrayPool<byte>.Shared.Return(buf);
+                if (f.ReturnToPool) ArrayPool<byte>.Shared.Return(f.Buffer);
             }
         }
 
-        /// <summary>Kết nối chủ động tới một endpoint. Trả về key "ip:port".</summary>
-        public async Task<string> ConnectAsync(string host, int port)
+        // ---------------- Reader loop ----------------
+
+        private async Task ReaderLoopAsync(Connection c)
         {
-            string key = $"{host}:{port}";
-            await GetOrConnectAsync(key);
-            return key;
-        }
-
-        private async Task<Peer> GetOrConnectAsync(string key)
-        {
-            if (_peers.TryGetValue(key, out Peer? existing))
-                return existing;
-
-            int idx = key.LastIndexOf(':');
-            if (idx < 0 || !int.TryParse(key[(idx + 1)..], out int port))
-                throw new ArgumentException($"Endpoint không hợp lệ: {key}");
-            string host = key[..idx];
-
-            var client = new TcpClient();
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
-            timeout.CancelAfter(TimeSpan.FromSeconds(3));
-            await client.ConnectAsync(host, port, timeout.Token);
-
-            // Kết nối ĐI: biết key ngay
-            var peer = MakePeer(client);
-            peer.Key = key;
-            RegisterPeer(key, peer);
-            OnPeerConnected?.Invoke(key);
-            _ = Task.Run(() => ReceiveLoopAsync(peer));
-            _ = Task.Run(() => SendHandshakeAsync(peer));
-            return peer;
-        }
-
-        private Peer MakePeer(TcpClient client)
-        {
-            client.NoDelay = true;
-            return new Peer { Client = client, Stream = client.GetStream() };
-        }
-
-        private void RegisterPeer(string key, Peer peer)
-        {
-            if (_peers.TryRemove(key, out Peer? old) && !ReferenceEquals(old, peer))
-                old.Client.Close();
-            _peers[key] = peer;
-        }
-
-        private async Task SendHandshakeAsync(Peer peer)
-        {
+            CancellationToken ct = c.Cts.Token;
+            byte[] header = new byte[Protocol.HeaderSize];
+            CloseReason reason = CloseReason.Closed;
             try
             {
-                var msg = new HandshakeMsg(_crypto.PublicKey, peer.MySalt, Dns.GetHostName(), ListenPort);
-                byte[] payload = JsonSerializer.SerializeToUtf8Bytes(msg);
-
-                await peer.WriteLock.WaitAsync(_cts.Token);
-                try
+                // ===== Bắt tay (có hạn chót — kẻ mở kết nối rồi im lặng sẽ bị đá) =====
+                using (var hs = CancellationTokenSource.CreateLinkedTokenSource(ct))
                 {
-                    await Protocol.WriteFrameAsync(peer.Stream, PacketType.Handshake, payload, _cts.Token);
+                    hs.CancelAfter(HandshakeTimeout);
+
+                    var (type, len) = await Protocol.ReadHeaderAsync(c.Stream, header, hs.Token).ConfigureAwait(false);
+                    if (type != RecordType.Hello || len > Protocol.MaxHelloSize)
+                        throw new HlcProtocolException("Gói đầu tiên phải là Hello");
+                    byte[] helloBytes = new byte[len];
+                    await c.Stream.ReadExactlyAsync(helloBytes, hs.Token).ConfigureAwait(false);
+                    Interlocked.Add(ref _bytesReceived, Protocol.HeaderSize + len);
+                    ProcessHello(c, helloBytes);
+
+                    (type, len) = await Protocol.ReadHeaderAsync(c.Stream, header, hs.Token).ConfigureAwait(false);
+                    if (type != RecordType.Sealed || len < 1 + Protocol.TagSize || len > Protocol.MaxHelloSize)
+                        throw new HlcProtocolException("Thiếu gói Auth");
+                    byte[] auth = new byte[len];
+                    await c.Stream.ReadExactlyAsync(auth, hs.Token).ConfigureAwait(false);
+                    Interlocked.Add(ref _bytesReceived, Protocol.HeaderSize + len);
+                    int plain = len - Protocol.TagSize;
+                    c.Rx!.OpenInPlace(auth.AsSpan(0, plain), auth.AsSpan(plain, Protocol.TagSize), header);
+                    if ((PacketType)auth[0] != PacketType.Auth)
+                        throw new HlcProtocolException("Gói Sealed đầu tiên phải là Auth");
+                    VerifyAuth(c, auth.AsSpan(1, plain - 1));
                 }
-                finally { peer.WriteLock.Release(); }
-            }
-            catch { RemovePeer(peer.Key); }
-        }
+                OnAuthenticated(c);
 
-        private async Task ReceiveLoopAsync(Peer peer)
-        {
-            try
-            {
-                while (!_cts.IsCancellationRequested)
+                // ===== Vòng nhận chính =====
+                while (true)
                 {
-                    var (type, payload) = await Protocol.ReadFrameAsync(peer.Stream, _cts.Token);
+                    var (type, len) = await Protocol.ReadHeaderAsync(c.Stream, header, ct).ConfigureAwait(false);
+                    if (type != RecordType.Sealed || len < 1 + Protocol.TagSize)
+                        throw new HlcProtocolException($"Record không hợp lệ: {type}");
 
-                    if (type == PacketType.Handshake)
+                    byte[] buf = ArrayPool<byte>.Shared.Rent(len);
+                    try
                     {
-                        HandleHandshake(peer, payload);
-                        continue;
+                        await c.Stream.ReadExactlyAsync(buf.AsMemory(0, len), ct).ConfigureAwait(false);
+                        c.LastRxTick = Environment.TickCount64;
+                        Interlocked.Add(ref _bytesReceived, Protocol.HeaderSize + len);
+
+                        int plain = len - Protocol.TagSize;
+                        c.Rx.OpenInPlace(buf.AsSpan(0, plain), buf.AsSpan(plain, Protocol.TagSize), header);
+                        await DispatchAsync(c, (PacketType)buf[0], buf.AsMemory(1, plain - 1)).ConfigureAwait(false);
                     }
-
-                    if (peer.SessionKey is null || peer.Key is null) continue;
-
-                    byte[] plaintext = CryptoService.Decrypt(peer.SessionKey, payload);
-                    switch (type)
+                    finally
                     {
-                        case PacketType.Text:
-                            OnTextReceived?.Invoke(peer.Key, Encoding.UTF8.GetString(plaintext));
-                            break;
-                        default:
-                            OnFrameReceived?.Invoke(peer.Key, type, plaintext);
-                            break;
+                        ArrayPool<byte>.Shared.Return(buf);
                     }
                 }
             }
-            catch { /* stream đóng / gói giả mạo — fail-closed */ }
+            catch (AuthenticationTagMismatchException) { reason = CloseReason.Tampered; }
+            catch (CryptographicException) { reason = c.Info is null ? CloseReason.AuthFailed : CloseReason.Tampered; }
+            catch (SelfConnectionException) { reason = CloseReason.SelfConnection; }
+            catch (HlcProtocolException) { reason = CloseReason.ProtocolError; }
+            catch (JsonException) { reason = CloseReason.ProtocolError; }
+            catch (EndOfStreamException) { reason = c.Draining ? CloseReason.PeerLeft : CloseReason.Closed; }
+            catch (OperationCanceledException)
+            {
+                reason = c.IsClosed ? c.Reason : (c.Info is null ? CloseReason.Timeout : CloseReason.Closed);
+            }
+            catch (Exception ex) { reason = ClassifyIo(ex); }
             finally
             {
-                RemovePeer(peer.Key);
+                Close(c, reason);
+                c.Rx?.Dispose();
             }
         }
 
-        private void HandleHandshake(Peer peer, byte[] payload)
+        private sealed class SelfConnectionException : Exception { }
+
+        private void ProcessHello(Connection c, byte[] helloBytes)
         {
-            var msg = JsonSerializer.Deserialize<HandshakeMsg>(payload)!;
+            var h = JsonSerializer.Deserialize<HelloMsg>(helloBytes)
+                    ?? throw new HlcProtocolException("Hello rỗng");
+            if (h.P != Protocol.Magic || h.V != Protocol.Version)
+                throw new HlcProtocolException($"Sai phiên bản giao thức ({h.P} v{h.V})");
+            if (h.Id is null || h.Eph is null || h.Nonce is null || h.Nonce.Length != Handshake.NonceSize ||
+                h.Id.Length > 512 || h.Eph.Length > 512 || h.Port is <= 0 or > 65535)
+                throw new HlcProtocolException("Hello thiếu trường");
+            if (!CryptoService.IsValidIdentityKey(h.Id))
+                throw new CryptographicException("Khóa danh tính không hợp lệ");
 
-            // Kết nối ĐẾN: giờ mới biết cổng lắng nghe thật của họ → chốt key
-            if (peer.Key is null)
+            string fp = CryptoService.ComputeFingerprint(h.Id);
+            if (fp == _crypto.Fingerprint) throw new SelfConnectionException();
+
+            byte[] theirHello = helloBytes;
+            var keys = c.IsInitiator
+                ? Handshake.Derive(c.Ephemeral, h.Eph, c.MyHello, theirHello)
+                : Handshake.Derive(c.Ephemeral, h.Eph, theirHello, c.MyHello);
+            c.Ephemeral.Dispose(); // hủy khóa tạm NGAY → forward secrecy
+
+            c.Tx = new CipherState(c.IsInitiator ? keys.InitiatorToResponder : keys.ResponderToInitiator);
+            c.Rx = new CipherState(c.IsInitiator ? keys.ResponderToInitiator : keys.InitiatorToResponder);
+            c.Transcript = keys.Transcript;
+            c.PeerHello = h with { Name = Clean(h.Name) };
+            c.Fingerprint = fp;
+
+            // Auth phải là gói Sealed ĐẦU TIÊN → enqueue trước khi mở cổng cho writer
+            byte[] sig = _crypto.Sign(Handshake.AuthData(keys.Transcript, c.IsInitiator));
+            TryEnqueueHigh(c, new OutFrame(PacketType.Auth, sig, 0, sig.Length, false, null), allowBeforeAuth: true);
+            c.KeysReady.TrySetResult();
+
+            static string Clean(string? s)
             {
-                string ip = ((IPEndPoint)peer.Client.Client.RemoteEndPoint!).Address.ToString();
-                peer.Key = $"{ip}:{msg.ListenPort}";
-                RegisterPeer(peer.Key, peer);
-                OnPeerConnected?.Invoke(peer.Key);
+                s = new string((s ?? "").Where(ch => !char.IsControl(ch)).Take(64).ToArray()).Trim();
+                return s.Length == 0 ? "(unnamed)" : s;
             }
-
-            peer.SessionKey = _crypto.DeriveSessionKey(msg.PublicKey, peer.MySalt, msg.Salt);
-            peer.Fingerprint = CryptoService.ComputeFingerprint(msg.PublicKey);
-            peer.RemoteName = msg.Name;
-
-            if (_seenFingerprints.TryGetValue(peer.Key, out string? known) && known != peer.Fingerprint)
-                OnKeyChanged?.Invoke(peer.Key, known, peer.Fingerprint);
-            _seenFingerprints[peer.Key] = peer.Fingerprint;
-
-            peer.Ready.TrySetResult();
-            OnPeerIdentified?.Invoke(peer.Key, peer.Fingerprint, peer.RemoteName);
         }
 
-        private void RemovePeer(string? key)
+        private static void VerifyAuth(Connection c, ReadOnlySpan<byte> signature)
         {
-            if (key is null) return;
-            if (_peers.TryRemove(key, out Peer? peer))
+            byte[] expected = Handshake.AuthData(c.Transcript!, asInitiator: !c.IsInitiator);
+            if (!CryptoService.Verify(c.PeerHello!.Id, expected, signature))
+                throw new CryptographicException("Chữ ký Auth sai — có thể bị tấn công MITM");
+        }
+
+        private void OnAuthenticated(Connection c)
+        {
+            var h = c.PeerHello!;
+            var info = new PeerSessionInfo(c.Fingerprint!, h.Name, h.Id, c.Remote, h.Port,
+                                           ComposeSessionId(c), c.IsInitiator, h.Instance);
+            c.Info = info;
+            c.LastRxTick = Environment.TickCount64;
+
+            Connection? loser = null;
+            bool becameActive;
+            lock (_sessionLock)
             {
-                peer.Ready.TrySetCanceled();
-                peer.Client.Close();
-                OnPeerDisconnected?.Invoke(key);
+                if (_sessions.TryGetValue(info.Fingerprint, out var existing) && existing != c && !existing.IsClosed)
+                {
+                    if (PreferNew(existing, c)) { _sessions[info.Fingerprint] = c; loser = existing; becameActive = true; }
+                    else { loser = c; becameActive = false; }
+                }
+                else
+                {
+                    _sessions[info.Fingerprint] = c;
+                    becameActive = true;
+                }
             }
+
+            AddEndpoint(info.Fingerprint, info.ListenEndPoint);
+            c.Authenticated.TrySetResult(info);
+            if (loser is not null) BeginGracefulClose(loser, CloseReason.Replaced);
+            if (becameActive) Raise(() => SessionEstablished?.Invoke(info));
+        }
+
+        private static string ComposeSessionId(Connection c)
+        {
+            // Session ID dẫn xuất từ transcript — hai bên hiển thị giống hệt nhau
+            byte[] h = SHA256.HashData(c.Transcript!);
+            return Convert.ToHexString(h, 0, 6);
+        }
+
+        /// <summary>
+        /// Tie-break TẤT ĐỊNH khi có 2 kết nối cùng tới một peer (cả hai bấm gửi cùng lúc):
+        /// giữ kết nối do bên có fingerprint NHỎ HƠN khởi tạo. Hai bên tự tính ra cùng một
+        /// kết luận mà không cần trao đổi gì thêm. Cùng người khởi tạo → giữ kết nối mới hơn
+        /// (trường hợp reconnect sau khi mạng chập chờn).
+        /// </summary>
+        private bool PreferNew(Connection existing, Connection candidate)
+        {
+            string InitiatorOf(Connection x) => x.IsInitiator ? _crypto.Fingerprint : x.Fingerprint!;
+            string a = InitiatorOf(existing), b = InitiatorOf(candidate);
+            if (a == b) return true;
+            return string.CompareOrdinal(b, a) < 0;
+        }
+
+        private ValueTask DispatchAsync(Connection c, PacketType type, ReadOnlyMemory<byte> payload)
+        {
+            string fp = c.Fingerprint!;
+            switch (type)
+            {
+                case PacketType.Ping:
+                    // KHÔNG await ghi trong reader loop (tránh deadlock khi 2 bên cùng đẩy file)
+                    TryEnqueueHigh(c, new OutFrame(PacketType.Pong, payload.ToArray(), 0, payload.Length, false, null));
+                    return ValueTask.CompletedTask;
+
+                case PacketType.Pong:
+                    if (payload.Length == 8)
+                    {
+                        long sent = BinaryPrimitives.ReadInt64LittleEndian(payload.Span);
+                        int rtt = (int)Math.Clamp(Environment.TickCount64 - sent, 0, 60_000);
+                        c.RttMs = rtt;
+                        if (GetActive(fp) == c) Raise(() => RttUpdated?.Invoke(fp, rtt));
+                    }
+                    return ValueTask.CompletedTask;
+
+                case PacketType.Bye:
+                    // Bên kia đóng êm (thoát app / tie-break). Ngừng dùng kết nối này để gửi.
+                    BeginGracefulClose(c, CloseReason.PeerLeft);
+                    return ValueTask.CompletedTask;
+
+                case PacketType.Auth:
+                    throw new HlcProtocolException("Auth lặp lại");
+
+                case PacketType.Text:
+                    string text = Encoding.UTF8.GetString(payload.Span);
+                    Raise(() => TextReceived?.Invoke(fp, text));
+                    return ValueTask.CompletedTask;
+
+                default:
+                    return InvokeFrameHandlerAsync(fp, type, payload);
+            }
+        }
+
+        private async ValueTask InvokeFrameHandlerAsync(string fp, PacketType type, ReadOnlyMemory<byte> payload)
+        {
+            if (FrameHandler is not { } handler) return;
+            try { await handler(fp, type, payload).ConfigureAwait(false); }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Lỗi tầng ứng dụng không được phép giết kết nối của mọi transfer khác
+                System.Diagnostics.Debug.WriteLine($"[FrameHandler] {type}: {ex}");
+            }
+        }
+
+        // ---------------- Heartbeat ----------------
+
+        private async Task HeartbeatLoopAsync(Connection c)
+        {
+            CancellationToken ct = c.Cts.Token;
+            try
+            {
+                await c.Authenticated.Task.WaitAsync(ct).ConfigureAwait(false);
+                byte[] ping = new byte[8];
+                while (!ct.IsCancellationRequested)
+                {
+                    BinaryPrimitives.WriteInt64LittleEndian(ping, Environment.TickCount64);
+                    TryEnqueueHigh(c, new OutFrame(PacketType.Ping, (byte[])ping.Clone(), 0, 8, false, null));
+                    await Task.Delay(PingIntervalMs, ct).ConfigureAwait(false);
+
+                    if (Environment.TickCount64 - Volatile.Read(ref c.LastRxTick) > DeadAfterMs)
+                    {
+                        Close(c, CloseReason.Timeout); // im lặng quá lâu → coi như mất mạng
+                        return;
+                    }
+                }
+            }
+            catch { /* kết nối đã đóng */ }
+        }
+
+        // ---------------- Đóng kết nối ----------------
+
+        /// <summary>Đóng êm: gửi nốt hàng đợi → Bye → FIN; reader nhận nốt dữ liệu của bên kia.</summary>
+        private void BeginGracefulClose(Connection c, CloseReason reason)
+        {
+            if (c.IsClosed || c.Draining) return;
+            c.Reason = reason;
+            c.Draining = true;
+            DetachSession(c, reason);
+            c.Items.Release(); // đánh thức writer
+            _ = Task.Delay(4000).ContinueWith(_ => Close(c, reason), TaskScheduler.Default);
+        }
+
+        private void Close(Connection c, CloseReason reason)
+        {
+            if (Interlocked.Exchange(ref c.ClosedFlag, 1) == 1) return;
+            if (!c.Draining) c.Reason = reason;
+            try { c.Cts.Cancel(); } catch { }
+            try { c.Client.Dispose(); } catch { }
+            try { c.Ephemeral.Dispose(); } catch { }
+            DrainQueues(c);
+            _all.TryRemove(c.Id, out _);
+            DetachSession(c, c.Reason);
+
+            if (!c.Authenticated.Task.IsCompleted)
+            {
+                c.Authenticated.TrySetException(new PeerUnavailableException(DescribeReject(c.Reason), c.Reason));
+                if (c.Reason is CloseReason.Tampered or CloseReason.AuthFailed or CloseReason.ProtocolError
+                             or CloseReason.SelfConnection)
+                    Raise(() => ConnectionRejected?.Invoke(c.Remote.ToString(), c.Reason, DescribeReject(c.Reason)));
+            }
+        }
+
+        private void DetachSession(Connection c, CloseReason reason)
+        {
+            if (c.Fingerprint is null) return;
+            bool lost = false;
+            lock (_sessionLock)
+            {
+                if (_sessions.TryGetValue(c.Fingerprint, out var cur) && cur == c)
+                {
+                    _sessions.Remove(c.Fingerprint);
+                    lost = true;
+                }
+            }
+            if (lost && reason != CloseReason.Replaced)
+            {
+                string fp = c.Fingerprint;
+                Raise(() => SessionLost?.Invoke(fp, reason));
+            }
+        }
+
+        private static string DescribeReject(CloseReason r) => r switch
+        {
+            CloseReason.SelfConnection => "Đây là chính máy này",
+            CloseReason.AuthFailed => "Xác thực danh tính thất bại",
+            CloseReason.Tampered => "Gói bị sửa đổi trên đường truyền",
+            CloseReason.ProtocolError => "Sai giao thức",
+            CloseReason.Timeout => "Hết thời gian bắt tay",
+            _ => "Kết nối bị đóng",
+        };
+
+        private static CloseReason ClassifyIo(Exception ex) => ex switch
+        {
+            AuthenticationTagMismatchException => CloseReason.Tampered,
+            HlcProtocolException => CloseReason.ProtocolError,
+            EndOfStreamException => CloseReason.Closed,
+            _ => CloseReason.NetworkError,
+        };
+
+        private static void Raise(Action a)
+        {
+            try { a(); }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"[Messaging event] {ex}"); }
+        }
+
+        /// <summary>CHỈ DÙNG CHO TEST: cắt phăng mọi kết nối (giả lập rút dây mạng).</summary>
+        internal void DebugKillConnections()
+        {
+            foreach (var c in _all.Values) Close(c, CloseReason.NetworkError);
         }
 
         public void Dispose()
         {
+            if (_cts.IsCancellationRequested) return;
+            // Báo Bye cho mọi peer để họ thấy mình offline NGAY (không phải chờ timeout 12s)
+            var writers = new List<Task>();
+            foreach (var c in _all.Values)
+            {
+                if (c.Authenticated.Task.IsCompletedSuccessfully)
+                {
+                    BeginGracefulClose(c, CloseReason.Shutdown);
+                    if (c.WriterTask is not null) writers.Add(c.WriterTask);
+                }
+            }
+            try { Task.WhenAll(writers).Wait(TimeSpan.FromMilliseconds(400)); } catch { }
+
             _cts.Cancel();
-            _listener.Stop();
-            foreach (var key in _peers.Keys) RemovePeer(key);
-            _cts.Dispose();
+            try { _listener?.Stop(); } catch { }
+            foreach (var c in _all.Values) Close(c, CloseReason.Shutdown);
         }
     }
 }
