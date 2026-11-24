@@ -94,8 +94,8 @@ namespace networkApp.Security
         public static string Vendor(string mac)
         {
             if (string.IsNullOrEmpty(mac) || mac.Length < 8) return "";
-            if (IsRandomizedMac(mac)) return Localization.Pick("MAC ngẫu nhiên (riêng tư)", "Randomized MAC (private)");
-            return Oui.TryGetValue(mac[..8], out var v) ? v : "";
+            if (Oui.TryGetValue(mac[..8], out var v)) return v; // vài hãng ảo hóa dùng dải "locally administered" có đăng ký
+            return IsRandomizedMac(mac) ? Localization.Pick("MAC ngẫu nhiên (riêng tư)", "Randomized MAC (private)") : "";
         }
 
         /// <summary>

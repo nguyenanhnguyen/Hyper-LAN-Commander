@@ -12,6 +12,7 @@ using System.Windows.Controls;
 using System.Windows.Data;
 using System.Windows.Input;
 using System.Windows.Threading;
+using networkApp.Security;
 
 namespace networkApp
 {
@@ -34,6 +35,10 @@ namespace networkApp
         private readonly Dictionary<string, ObservableCollection<ChatItem>> _history = new();
         private readonly Dictionary<Guid, TransferViewModel> _transfers = new();
         private PeerViewModel? _active;
+
+        private readonly SecurityLog _secLog = new();
+        private readonly ThreatMonitor _monitor;
+        private readonly LinkTestService _linkTest;
 
         private readonly DispatcherTimer _statsTimer;
         private long _lastSent, _lastRecv;
@@ -59,6 +64,29 @@ namespace networkApp
                                               _profile.DisplayName, _messaging.ListenPort);
             WireDiscovery();
             _discovery.Start();
+
+            // ---------- Security Center ----------
+            _linkTest = new LinkTestService(_messaging);
+            _monitor = new ThreatMonitor(_secLog);
+            _monitor.Start();
+            securityView.Initialize(new SecurityContext
+            {
+                Messaging = _messaging,
+                Discovery = _discovery,
+                Log = _secLog,
+                Monitor = _monitor,
+                LinkTest = _linkTest,
+                MachineName = _profile.DisplayName,
+                Fingerprint = _crypto.Fingerprint,
+                ReportFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "HyperLAN Reports"),
+                ConnectedPeers = () => _peers.Where(p => p.IsConnected)
+                                             .Select(p => new PeerOption { Fingerprint = p.Fingerprint, Name = p.Name }).ToList(),
+            });
+            securityView.UnseenAlertsChanged += n =>
+            {
+                badgeAlerts.Visibility = n > 0 ? Visibility.Visible : Visibility.Collapsed;
+                txtAlerts.Text = n > 9 ? "9+" : n.ToString();
+            };
 
             var view = (ListCollectionView)CollectionViewSource.GetDefaultView(_peers);
             view.SortDescriptions.Add(new SortDescription(nameof(PeerViewModel.SortKey), ListSortDirection.Ascending));
@@ -127,7 +155,13 @@ namespace networkApp
                 if (!_peerByFp.TryGetValue(fp, out var vm)) return;
                 vm.IsConnected = false;
                 if (reason == CloseReason.Tampered)
+                {
                     AddChat(fp, new ChatItem { Kind = ChatKind.Warning, Text = Localization.T("L_TamperedChat") });
+                    _secLog.Add(Severity.High, SecurityCategory.Protocol,
+                        Localization.Pick($"Phiên với {vm.Name} bị cắt: gói tin bị sửa trên đường truyền", $"Session with {vm.Name} terminated: packet modified in transit"),
+                        Localization.Pick("Một record không qua được kiểm tra AES-GCM (tag sai / nonce lệch) — dấu hiệu MITM chủ động. Fail-closed.",
+                                          "A record failed AES-GCM verification (bad tag / nonce mismatch) — sign of an active MITM. Fail-closed."));
+                }
                 if (reason != CloseReason.Shutdown) SetStatus(Fmt.F("L_SessionLost", vm.Name));
                 UpdatePeerCount();
                 if (vm == _active) RefreshHeader();
@@ -148,17 +182,31 @@ namespace networkApp
                 FlashIfInactive();
             });
 
-            _messaging.ConnectionRejected += (endpoint, reason, _) => Ui(() =>
+            _messaging.ConnectionRejected += (endpoint, reason, detail) => Ui(() =>
             {
                 if (reason == CloseReason.SelfConnection) return; // đã báo ở nút Kết nối
                 string why = reason switch
                 {
                     CloseReason.Tampered => "AES-GCM tag mismatch",
-                    CloseReason.AuthFailed => "ECDSA signature invalid",
+                    CloseReason.AuthFailed => "handshake authentication failed (ECDSA/transcript)",
                     CloseReason.ProtocolError => "protocol violation",
+                    CloseReason.IdentityMismatch => "identity mismatch",
+                    CloseReason.Timeout => "handshake timeout",
                     _ => reason.ToString(),
                 };
-                SetStatus(Fmt.F("L_Rejected", endpoint, why));
+                if (reason != CloseReason.Timeout) SetStatus(Fmt.F("L_Rejected", endpoint, why));
+
+                // IDS: ghi vào nhật ký an ninh (Timeout = có thể là port scan / slowloris)
+                var (sev, title) = reason switch
+                {
+                    CloseReason.IdentityMismatch => (Severity.High, Localization.Pick("Địa chỉ của peer trả lời bằng danh tính KHÁC — nghi mạo danh", "Peer address answered with a DIFFERENT identity — possible impersonation")),
+                    CloseReason.AuthFailed => (Severity.High, Localization.Pick("Bắt tay thất bại xác thực — nghi MITM", "Handshake failed authentication — possible MITM")),
+                    CloseReason.Tampered => (Severity.High, Localization.Pick("Gói bị sửa đổi trong lúc bắt tay", "Packet modified during handshake")),
+                    CloseReason.ProtocolError => (Severity.Medium, Localization.Pick("Kết nối vi phạm giao thức (rác / fuzzing / client lạ)", "Protocol violation (garbage / fuzzing / foreign client)")),
+                    _ => (Severity.Low, Localization.Pick("Kết nối không bắt tay (port scan / slowloris?)", "Connection never completed the handshake (port scan / slowloris?)")),
+                };
+                _secLog.Add(sev, SecurityCategory.Protocol, title, $"{endpoint} · {why} · {detail}",
+                            dedupeKey: reason == CloseReason.Timeout ? $"hs-timeout:{endpoint.Split(':')[0]}" : null);
             });
         }
 
@@ -188,6 +236,9 @@ namespace networkApp
                 });
                 if (_peerByFp.TryGetValue(old.Fingerprint, out var oldVm) && !oldVm.IsOnline)
                     RemovePeer(oldVm);
+                _secLog.Add(old.Verified ? Severity.Critical : Severity.High, SecurityCategory.Identity,
+                    Localization.Pick($"Danh tính của \"{info.Name}\" đã thay đổi", $"Identity of \"{info.Name}\" changed"),
+                    $"{old.Fingerprint} → {info.Fingerprint} · {info.RemoteEndPoint}");
                 MessageBox.Show(this,
                     Fmt.F("L_KeyChangedBody", info.Name, old.Fingerprint, info.Fingerprint,
                           old.Verified ? Localization.T("L_WasVerified") : ""),
@@ -228,6 +279,12 @@ namespace networkApp
 
                 if (snap.State == TransferState.Completed)
                     SetStatus(Fmt.F(snap.Direction == TransferDirection.Send ? "L_SentStatus" : "L_RecvStatus", snap.FileName));
+                if (snap.State == TransferState.Failed && snap.Error == TransferError.Integrity)
+                    _secLog.Add(Severity.High, SecurityCategory.Protocol,
+                        Localization.Pick($"File \"{snap.FileName}\" sai SHA-256 — đã loại bỏ", $"File \"{snap.FileName}\" failed SHA-256 — discarded"),
+                        Localization.Pick("Dữ liệu nhận được không khớp hash của người gửi (đĩa lỗi hoặc phần .part không khớp).",
+                                          "Received data does not match the sender's hash (disk error or mismatching partial file)."),
+                        dedupeKey: "sha:" + snap.Id);
             });
         }
 
@@ -582,9 +639,26 @@ namespace networkApp
         private void btnOpenDownloads_Click(object sender, RoutedEventArgs e)
             => StartProcess("explorer.exe", $"\"{_profile.DownloadDir}\"");
 
+        // ---------- Điều hướng Chat / Security ----------
+
+        private void navChat_Click(object sender, RoutedEventArgs e) => ShowSecurity(false);
+
+        private void navSecurity_Click(object sender, RoutedEventArgs e) => ShowSecurity(true);
+
+        private void ShowSecurity(bool security)
+        {
+            securityView.Visibility = security ? Visibility.Visible : Visibility.Collapsed;
+            chatView.Visibility = security ? Visibility.Collapsed : Visibility.Visible;
+            securityView.IsShown = security;
+            if (security) securityView.MarkSeen();
+            navChat.Style = (Style)FindResource(security ? "NavIdle" : "BtnPrimary");
+            navSecurity.Style = (Style)FindResource(security ? "BtnPrimary" : "NavIdle");
+        }
+
         private void btnLang_Click(object sender, RoutedEventArgs e)
         {
             Localization.Toggle();
+            securityView.RefreshTexts();
             foreach (var p in _peers) p.RefreshTexts();
             foreach (var t in _transfers.Values) t.RefreshTexts();
             UpdatePeerCount();
@@ -676,6 +750,9 @@ namespace networkApp
         protected override void OnClosed(EventArgs e)
         {
             _statsTimer.Stop();
+            securityView.Shutdown();
+            _monitor.Dispose();
+            _linkTest.Dispose();
             _files.Dispose();
             _discovery.Dispose();   // Bye UDP → mọi người thấy mình offline ngay
             _messaging.Dispose();   // Bye TCP trên từng phiên

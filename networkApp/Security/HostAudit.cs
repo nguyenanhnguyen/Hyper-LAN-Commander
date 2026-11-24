@@ -35,6 +35,8 @@ namespace networkApp.Security
     /// </summary>
     public static class HostAudit
     {
+        private const string LocationBlocked = "<location-permission-required>";
+
         public static HostAuditReport Run()
         {
             var findings = new List<AuditFinding>();
@@ -55,17 +57,31 @@ namespace networkApp.Security
 
             // ---------- Loại mạng ----------
             var networks = ConnectedNetworks();
+            string[] publicHints = { "free", "guest", "cafe", "coffee", "hotel", "airport", "public" };
             foreach (var (name, cat) in networks)
-                if (cat == "Private" && name.Contains("Free", StringComparison.OrdinalIgnoreCase) ||
-                    cat == "Private" && name.Contains("Guest", StringComparison.OrdinalIgnoreCase) ||
-                    cat == "Private" && name.Contains("Cafe", StringComparison.OrdinalIgnoreCase))
+            {
+                if (cat == "Private" && publicHints.Any(h => name.Contains(h, StringComparison.OrdinalIgnoreCase)))
                     findings.Add(new AuditFinding(Severity.Medium,
                         Localization.Pick($"Mạng \"{name}\" đang được tin cậy (Private)", $"Network \"{name}\" is trusted (Private)"),
                         Localization.Pick("Tên mạng giống Wi-Fi công cộng — nên đặt Public để Windows chặn chia sẻ/khám phá.",
                                           "Looks like public Wi-Fi — set it to Public so Windows blocks sharing/discovery.")));
+                else if (cat == "Public")
+                    findings.Add(new AuditFinding(Severity.Info,
+                        Localization.Pick($"Mạng \"{name}\" ở chế độ Public", $"Network \"{name}\" is set to Public"),
+                        Localization.Pick("Tốt cho Wi-Fi không tin cậy. Lưu ý: Windows Firewall có thể chặn kết nối ĐẾN của Hyper-LAN trên mạng Public nếu bạn chỉ cho phép ở Private.",
+                                          "Good for untrusted Wi-Fi. Note: Windows Firewall may block INBOUND Hyper-LAN connections on Public networks if the app is only allowed on Private.")));
+            }
 
             // ---------- Wi-Fi ----------
             var wifi = WifiStatus();
+            if (wifi?.Authentication == LocationBlocked)
+            {
+                findings.Add(new AuditFinding(Severity.Info,
+                    Localization.Pick("Không đọc được cấu hình bảo mật Wi-Fi", "Wi-Fi security settings unavailable"),
+                    Localization.Pick("Từ Windows 11 24H2, netsh wlan cần quyền Vị trí: Settings → Privacy & security → Location → bật cho ứng dụng desktop.",
+                                      "Since Windows 11 24H2, netsh wlan needs Location access: Settings → Privacy & security → Location → allow desktop apps.")));
+                wifi = null;
+            }
             if (wifi is not null)
             {
                 string a = wifi.Authentication.ToUpperInvariant(), c = wifi.Cipher.ToUpperInvariant();
@@ -157,6 +173,9 @@ namespace networkApp.Security
                 using var p = Process.Start(psi)!;
                 string output = p.StandardOutput.ReadToEnd();
                 p.WaitForExit(3000);
+                if (output.Contains("location permission", StringComparison.OrdinalIgnoreCase) ||
+                    output.Contains("ms-settings:privacy-location", StringComparison.OrdinalIgnoreCase))
+                    return new WifiInfo("", LocationBlocked, "", "", ""); // Windows 11 24H2+: cần bật Location
 
                 var values = output.Split('\n')
                     .Select(l => l.Split(new[] { ':' }, 2))

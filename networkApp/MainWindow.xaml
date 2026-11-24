@@ -241,8 +241,9 @@
                     <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
 
-                <!-- Logo -->
-                <Grid Grid.Row="0">
+                <!-- Logo + điều hướng -->
+                <StackPanel Grid.Row="0">
+                <Grid>
                     <StackPanel Orientation="Horizontal">
                         <Border Width="36" Height="36" CornerRadius="10">
                             <Border.Background>
@@ -266,10 +267,33 @@
                                 Content="{DynamicResource L_LangToggle}" Click="btnLang_Click"/>
                     </StackPanel>
                 </Grid>
+                <Border Background="{StaticResource SideCard}" CornerRadius="10" Padding="3" Margin="0,14,0,0"
+                        BorderBrush="{StaticResource SideBorder}" BorderThickness="1">
+                    <UniformGrid Columns="2">
+                        <Button x:Name="navChat" Style="{StaticResource BtnPrimary}" Height="32" Click="navChat_Click">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="💬  "/>
+                                <TextBlock Text="{DynamicResource N_Chat}"/>
+                            </StackPanel>
+                        </Button>
+                        <Button x:Name="navSecurity" Style="{StaticResource NavIdle}" Height="32" Click="navSecurity_Click">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="🛡  "/>
+                                <TextBlock Text="{DynamicResource N_Security}"/>
+                                <Border x:Name="badgeAlerts" CornerRadius="8" Background="{StaticResource Danger}" MinWidth="16" Height="16"
+                                        Padding="4,0" Margin="6,0,0,0" Visibility="Collapsed">
+                                    <TextBlock x:Name="txtAlerts" FontSize="10" FontWeight="Bold" Foreground="White"
+                                               HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                </Border>
+                            </StackPanel>
+                        </Button>
+                    </UniformGrid>
+                </Border>
+                </StackPanel>
 
                 <!-- Thẻ danh tính -->
                 <Border Grid.Row="1" Background="{StaticResource SideCard}" CornerRadius="12" Padding="14,12"
-                        Margin="0,16,0,0" BorderBrush="{StaticResource SideBorder}" BorderThickness="1">
+                        Margin="0,12,0,0" BorderBrush="{StaticResource SideBorder}" BorderThickness="1">
                     <StackPanel>
                         <TextBlock Text="{DynamicResource L_YourIdentity}" FontSize="10" FontWeight="Bold"
                                    Foreground="{StaticResource SideMuted}"/>
@@ -331,8 +355,11 @@
             </Grid>
         </Border>
 
+        <!-- ======================= SECURITY CENTER ======================= -->
+        <local:SecurityCenterView x:Name="securityView" Grid.Column="1" Visibility="Collapsed"/>
+
         <!-- ======================= CHAT ======================= -->
-        <Grid Grid.Column="1">
+        <Grid Grid.Column="1" x:Name="chatView">
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>

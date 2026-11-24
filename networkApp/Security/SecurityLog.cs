@@ -25,15 +25,19 @@ namespace networkApp.Security
 
         public event Action<SecurityEvent>? Added;
 
-        /// <summary>Ghi sự kiện. Cùng <paramref name="dedupeKey"/> trong cửa sổ 60s chỉ ghi một lần (chống spam).</summary>
-        public void Add(Severity sev, SecurityCategory cat, string title, string detail, string? dedupeKey = null)
+        /// <summary>
+        /// Ghi sự kiện. Cùng <paramref name="dedupeKey"/> trong <paramref name="dedupeWindow"/> (mặc định 10 phút)
+        /// chỉ ghi một lần — tình trạng kéo dài không làm ngập nhật ký.
+        /// </summary>
+        public void Add(Severity sev, SecurityCategory cat, string title, string detail, string? dedupeKey = null,
+                        TimeSpan? dedupeWindow = null)
         {
             var ev = new SecurityEvent(DateTime.Now, sev, cat, title, detail);
             lock (_lock)
             {
                 if (dedupeKey is not null)
                 {
-                    if (_dedupe.TryGetValue(dedupeKey, out var last) && DateTime.Now - last < TimeSpan.FromSeconds(60))
+                    if (_dedupe.TryGetValue(dedupeKey, out var last) && DateTime.Now - last < (dedupeWindow ?? TimeSpan.FromMinutes(10)))
                         return;
                     _dedupe[dedupeKey] = DateTime.Now;
                 }

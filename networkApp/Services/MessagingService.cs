@@ -43,12 +43,14 @@ namespace networkApp
         string Note,
         int Aggregated = 1);  // >1: gộp nhiều FileChunk để không ngập UI
 
-    public enum CloseReason { Closed, PeerLeft, Timeout, NetworkError, Tampered, ProtocolError, AuthFailed, Replaced, SelfConnection, Shutdown }
+    public enum CloseReason { Closed, PeerLeft, Timeout, NetworkError, Tampered, ProtocolError, AuthFailed, Replaced, SelfConnection, Shutdown, IdentityMismatch }
 
     /// <summary>Không có/mất đường tới peer. Là IOException → tầng trên coi là lỗi mạng tạm thời.</summary>
     public sealed class PeerUnavailableException : IOException
     {
         public CloseReason Reason { get; }
+        /// <summary>true = gói CHƯA hề được ghi xuống socket (bị rút khỏi hàng đợi khi kết nối đóng) → gửi lại an toàn.</summary>
+        public bool NotSent { get; init; }
         public PeerUnavailableException(string message, CloseReason reason = CloseReason.NetworkError)
             : base(message) => Reason = reason;
     }
@@ -298,8 +300,16 @@ namespace networkApp
                     if (attempt < 3) continue; // phiên vừa bị thay thế → lấy phiên mới
                     throw new PeerUnavailableException("Phiên đã đóng");
                 }
-                await done.Task.WaitAsync(ct).ConfigureAwait(false);
-                return;
+                try
+                {
+                    await done.Task.WaitAsync(ct).ConfigureAwait(false);
+                    return;
+                }
+                catch (PeerUnavailableException ex) when (ex.NotSent && attempt < 3 && !ct.IsCancellationRequested)
+                {
+                    // Kết nối bị thay (tie-break) / đóng ngay khi gói còn trong hàng đợi — gói chưa lên dây
+                    // nên gửi lại qua phiên mới KHÔNG gây trùng lặp.
+                }
             }
         }
 
@@ -382,6 +392,7 @@ namespace networkApp
                     throw new PeerUnavailableException("Chưa biết địa chỉ của peer này (offline?)");
 
                 var remaining = book.ToList();
+                string? mismatch = null;
                 while (remaining.Count > 0)
                 {
                     TcpClient client = await RaceConnectAsync(remaining, _cts.Token).ConfigureAwait(false);
@@ -399,14 +410,18 @@ namespace networkApp
 
                     if (info.Fingerprint != fp)
                     {
-                        // Địa chỉ này giờ là của một danh tính KHÁC (IP bị tái cấp phát, hoặc gói
-                        // discovery giả mạo) — phiên kia vẫn hợp lệ, nhưng không phải người ta cần.
+                        // Địa chỉ này giờ là của một danh tính KHÁC (IP bị tái cấp phát, ARP/DNS spoofing,
+                        // gói discovery giả mạo) — KHÔNG gửi gì cho nó. Phiên kia vẫn hợp lệ với danh tính của nó.
                         if (_books.TryGetValue(fp, out var bk)) bk.Remove(ep);
+                        mismatch = $"{ep} = {info.Fingerprint} ({info.Name}), expected {fp}";
+                        Raise(() => ConnectionRejected?.Invoke(ep.ToString(), CloseReason.IdentityMismatch, mismatch));
                         continue;
                     }
                     return GetActive(fp) ?? conn;
                 }
-                throw new PeerUnavailableException("Không địa chỉ nào của peer phản hồi");
+                throw mismatch is not null
+                    ? new PeerUnavailableException("Danh tính không khớp: " + mismatch, CloseReason.IdentityMismatch)
+                    : new PeerUnavailableException("Không địa chỉ nào của peer phản hồi");
             }
             finally
             {
@@ -582,7 +597,7 @@ namespace networkApp
 
         private static void DrainQueues(Connection c)
         {
-            var ex = new PeerUnavailableException("Kết nối đã đóng", c.Reason);
+            var ex = new PeerUnavailableException("Kết nối đã đóng", c.Reason) { NotSent = true };
             while (c.High.TryDequeue(out var f)) Fail(f, ex);
             while (c.Bulk.TryDequeue(out var f)) Fail(f, ex);
 

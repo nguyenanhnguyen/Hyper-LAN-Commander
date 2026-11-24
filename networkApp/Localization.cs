@@ -143,6 +143,67 @@ namespace networkApp
             ["L_SentStatus"] = ("Đã giao {0}", "Delivered {0}"),
             ["L_RecvStatus"] = ("Đã nhận {0}", "Received {0}"),
 
+            // ---- Điều hướng ----
+            ["N_Chat"] = ("Trò chuyện", "Chat"),
+            ["N_Security"] = ("An ninh", "Security"),
+
+            // ---- Security Center ----
+            ["S_Title"] = ("Trung tâm An ninh Mạng", "Network Security Center"),
+            ["S_Subtitle"] = ("Kiểm định LAN · giám sát tấn công · soi giao thức · tự tấn công chứng minh",
+                              "LAN audit · threat monitoring · protocol inspection · self-attack proofs"),
+            ["S_Export"] = ("Xuất báo cáo HTML", "Export HTML report"),
+            ["S_TabOverview"] = ("Tổng quan", "Overview"),
+            ["S_TabLan"] = ("Kiểm định LAN", "LAN Audit"),
+            ["S_TabDevice"] = ("Máy này", "This Device"),
+            ["S_TabInspector"] = ("Soi giao thức", "Protocol Inspector"),
+            ["S_TabLab"] = ("Attack Lab", "Attack Lab"),
+            ["S_TabTools"] = ("Công cụ", "Tools"),
+
+            ["S_CardDevice"] = ("ĐIỂM MÁY NÀY", "DEVICE SCORE"),
+            ["S_CardLan"] = ("THIẾT BỊ TRONG LAN", "LAN DEVICES"),
+            ["S_CardMonitor"] = ("GIÁM SÁT ARP", "ARP MONITOR"),
+            ["S_CardLab"] = ("ATTACK LAB", "ATTACK LAB"),
+            ["S_CardProtocol"] = ("GIAO THỨC HLC2", "HLC2 PROTOCOL"),
+            ["S_Events"] = ("Nhật ký sự kiện an ninh", "Security event log"),
+            ["S_NoEvents"] = ("Chưa có sự kiện nào. Giám sát ARP chạy nền mỗi 4 giây.", "No events yet. The ARP monitor runs every 4 seconds."),
+            ["S_NotRun"] = ("chưa chạy", "not run"),
+
+            ["S_LanIntro"] = ("Quét không xâm nhập: ping sweep → bảng ARP → TCP connect scan các cổng hay bị khai thác → banner, chứng chỉ TLS, Redis không mật khẩu… Chỉ dải private, không thử mật khẩu.",
+                              "Non-intrusive: ping sweep → ARP table → TCP connect scan of commonly abused ports → banners, TLS certificates, unauthenticated Redis… Private ranges only, no password guessing."),
+            ["S_Interface"] = ("Card mạng", "Interface"),
+            ["S_WholeSubnet"] = ("Cả subnet (tối đa /22)", "Whole subnet (max /22)"),
+            ["S_Consent"] = ("Tôi sở hữu hoặc được phép kiểm định mạng này", "I own or am authorized to audit this network"),
+            ["S_StartScan"] = ("Bắt đầu quét", "Start scan"),
+            ["S_Stop"] = ("Dừng", "Stop"),
+            ["S_NeedConsent"] = ("Hãy xác nhận bạn có quyền kiểm định mạng này.", "Please confirm you are authorized to audit this network."),
+
+            ["S_DeviceIntro"] = ("Bề mặt tấn công của chính máy này: cổng đang lắng nghe + tiến trình, firewall, loại mạng, bảo mật Wi-Fi.",
+                                 "This machine's attack surface: listening ports + processes, firewall, network profile, Wi-Fi security."),
+            ["S_RunAudit"] = ("Kiểm tra lại", "Re-run audit"),
+            ["S_Listeners"] = ("Cổng đang lắng nghe", "Listening sockets"),
+            ["S_OnlyExposed"] = ("Chỉ hiện cổng lộ ra mạng", "Exposed only"),
+
+            ["S_InspIntro"] = ("Mọi record HLC2 vào/ra máy này theo thời gian thực. Bật \"Góc nhìn kẻ nghe lén\" để thấy đúng những gì Wireshark thấy.",
+                               "Every HLC2 record entering/leaving this machine, live. Toggle \"Eavesdropper view\" to see exactly what Wireshark sees."),
+            ["S_Capture"] = ("Ghi", "Capture"),
+            ["S_Eavesdrop"] = ("Góc nhìn kẻ nghe lén", "Eavesdropper view"),
+            ["S_Clear"] = ("Xóa", "Clear"),
+            ["S_InspHint"] = ("Gửi một tin nhắn hoặc file cho peer để thấy bắt tay ECDHE, chữ ký ECDSA và các record AES-GCM.",
+                              "Send a message or file to a peer to watch the ECDHE handshake, ECDSA signature and AES-GCM records."),
+
+            ["S_LabIntro"] = ("Tự tấn công chính giao thức của app bằng proxy MITM trên 127.0.0.1 — 13 đòn kinh điển, mỗi đòn có bằng chứng đo được. Chạy cô lập, không ảnh hưởng phiên thật.",
+                              "Attack the app's own protocol through a MITM proxy on 127.0.0.1 — 13 classic attacks, each with measured evidence. Fully isolated from real sessions."),
+            ["S_RunLab"] = ("Chạy toàn bộ tấn công", "Run all attacks"),
+            ["S_Defense"] = ("Phòng thủ", "Defense"),
+            ["S_Evidence"] = ("Bằng chứng", "Evidence"),
+
+            ["S_ToolsIntro"] = ("Chẩn đoán mạng: ICMP ping, traceroute (TTL tăng dần), DNS; đo đường truyền mã hóa tới peer (RTT, jitter, thông lượng).",
+                                "Diagnostics: ICMP ping, traceroute (incrementing TTL), DNS; encrypted link test to a peer (RTT, jitter, throughput)."),
+            ["S_Target"] = ("Đích (IP / tên miền)", "Target (IP / hostname)"),
+            ["S_LinkTest"] = ("Đo đường truyền mã hóa tới peer", "Encrypted link test to peer"),
+            ["S_Run"] = ("Chạy", "Run"),
+            ["S_NoPeers"] = ("(chưa có phiên nào đang mở)", "(no active sessions)"),
+
             // ---- An ninh ----
             ["L_KeyChangedChat"] = ("⚠ CẢNH BÁO: tên máy \"{0}\" trước đây thuộc danh tính {1}, nay là {2}!",
                                     "⚠ WARNING: the name \"{0}\" used to belong to identity {1}, now it is {2}!"),

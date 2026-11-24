@@ -99,6 +99,11 @@
             <Setter Property="BorderThickness" Value="1"/>
         </Style>
 
+        <Style x:Key="NavIdle" TargetType="Button" BasedOn="{StaticResource BtnBase}">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="{StaticResource SideMuted}"/>
+        </Style>
+
         <Style x:Key="BtnSideIcon" TargetType="Button" BasedOn="{StaticResource BtnSide}">
             <Setter Property="Padding" Value="0"/>
             <Setter Property="Width" Value="30"/>

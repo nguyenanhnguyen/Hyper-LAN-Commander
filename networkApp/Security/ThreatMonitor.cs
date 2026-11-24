@@ -25,7 +25,8 @@ namespace networkApp.Security
         private readonly CancellationTokenSource _cts = new();
         private readonly Dictionary<string, string> _ipToMac = new();     // ip → mac (baseline)
         private readonly HashSet<string> _knownMacs = new(StringComparer.OrdinalIgnoreCase);
-        private readonly Dictionary<string, string> _gatewayMac = new();  // gatewayIp → mac
+        private readonly Dictionary<string, string> _gatewayMac = new();  // gatewayIp → mac (lần gần nhất)
+        private readonly Dictionary<string, string> _firstGatewayMac = new(); // gatewayIp → mac (baseline)
         private string _netSignature = "";
         private bool _baselined;
 
@@ -84,21 +85,39 @@ namespace networkApp.Security
                         dedupeKey: $"gwmac:{ip}:{entry.Mac}");
                 }
                 _gatewayMac[ip] = entry.Mac;
+                _firstGatewayMac.TryAdd(ip, entry.Mac);
             }
             GatewayInfo = string.Join(", ", gwInfo);
 
-            // ----- 2. Một MAC giữ nhiều IP (có gateway) -----
+            // ----- 2. Một MAC giữ nhiều IP, trong đó có gateway -----
+            // Hai khả năng cho cùng một hình ảnh trong bảng ARP:
+            //  (a) PROXY ARP: chính router/AP trả lời ARP thay cho các máy khác (Wi-Fi bật client
+            //      isolation — quán cà phê, khách sạn, campus). MAC chung = MAC gateway ỔN ĐỊNH từ baseline.
+            //  (b) ARP POISONING: máy kẻ tấn công nhận cả IP gateway lẫn IP của chính nó.
+            //      MAC chung KHÁC MAC gateway ban đầu (đã bắt ở bước 1) hoặc ta không có baseline sạch.
             foreach (var g in table.GroupBy(e => e.Mac, StringComparer.OrdinalIgnoreCase).Where(g => g.Count() > 1))
             {
                 var ips = g.Select(e => e.Address).ToList();
-                bool claimsGateway = ips.Any(ip => gateways.Any(gw => gw.Equals(ip)));
-                if (!claimsGateway) continue; // nhiều IP/1 MAC không có gateway: thường là máy ảo/alias — bỏ qua
-                _log.Add(Severity.High, SecurityCategory.Arp,
-                    Localization.Pick("Một MAC nhận nhiều IP, gồm cả gateway", "One MAC claims several IPs including the gateway"),
-                    Localization.Pick(
-                        $"{g.Key} ↔ {string.Join(", ", ips)} — đúng chữ ký của arpspoof/Bettercap (đầu độc ARP 2 chiều).",
-                        $"{g.Key} ↔ {string.Join(", ", ips)} — the signature of arpspoof/Bettercap (two-way ARP poisoning)."),
-                    dedupeKey: $"multi:{g.Key}:{string.Join(",", ips)}");
+                var gwIp = ips.FirstOrDefault(ip => gateways.Any(gw => gw.Equals(ip)));
+                if (gwIp is null || !_baselined) continue; // không dính gateway (máy ảo/alias) hoặc chưa có baseline
+                string others = string.Join(", ", ips.Where(ip => !ip.Equals(gwIp)));
+                _firstGatewayMac.TryGetValue(gwIp.ToString(), out string? first);
+                bool stableGatewayMac = first is not null && first.Equals(g.Key, StringComparison.OrdinalIgnoreCase);
+
+                if (stableGatewayMac)
+                    _log.Add(Severity.Info, SecurityCategory.Arp,
+                        Localization.Pick("Router dùng Proxy ARP (Wi-Fi cô lập client)", "Router uses Proxy ARP (Wi-Fi client isolation)"),
+                        Localization.Pick(
+                            $"MAC gateway {g.Key} trả lời thay cho {others}. Mạng này chặn các máy nói chuyện trực tiếp với nhau — Hyper-LAN giữa hai máy có thể không kết nối được (không phải lỗi app). MAC gateway ổn định từ đầu → không có dấu hiệu bị đầu độc.",
+                            $"Gateway MAC {g.Key} answers for {others}. This network isolates clients from each other — Hyper-LAN between two machines may not connect (not an app bug). Gateway MAC has been stable → no sign of poisoning."),
+                        dedupeKey: $"proxyarp:{g.Key}", dedupeWindow: TimeSpan.FromHours(12));
+                else
+                    _log.Add(Severity.High, SecurityCategory.Arp,
+                        Localization.Pick("Một MAC lạ nhận cả IP gateway lẫn IP khác — nghi ARP poisoning", "A foreign MAC claims the gateway IP and other IPs — suspected ARP poisoning"),
+                        Localization.Pick(
+                            $"{g.Key} ↔ {gwIp} (gateway), {others}. MAC này KHÁC MAC gateway ban đầu ({first ?? "?"}) — đúng chữ ký của arpspoof/Bettercap.",
+                            $"{g.Key} ↔ {gwIp} (gateway), {others}. This MAC DIFFERS from the original gateway MAC ({first ?? "?"}) — the signature of arpspoof/Bettercap."),
+                        dedupeKey: $"multi:{g.Key}");
             }
 
             // ----- 3. IP đổi MAC / 4. thiết bị mới -----
@@ -153,6 +172,7 @@ namespace networkApp.Security
                     dedupeKey: "netcfg:" + sig);
                 // Đổi mạng thật → làm lại baseline ARP để không báo động giả hàng loạt
                 _gatewayMac.Clear();
+                _firstGatewayMac.Clear();
                 _ipToMac.Clear();
             }
             _netSignature = sig;

@@ -1,3 +1,4 @@
 <Solution>
   <Project Path="networkApp.csproj" />
+  <Project Path="../tests/HlcTests/HlcTests.csproj" />
 </Solution>

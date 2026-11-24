@@ -247,7 +247,7 @@ namespace networkApp.Security
             catch (Exception ex) { err = ex; }
             await Task.Delay(300, ct).ConfigureAwait(false);
 
-            bool ok = err is not null && mallory.Texts.IsEmpty;
+            bool ok = err is PeerUnavailableException { Reason: CloseReason.IdentityMismatch } && mallory.Texts.IsEmpty;
             return new LabResult("impersonation",
                 P("Mạo danh (máy giả cùng tên, chiếm địa chỉ)", "Impersonation (rogue host, same name, hijacked address)"),
                 P("Địa chỉ của Bob bị trỏ sang máy Mallory (như sau ARP/DNS spoofing). Mallory tự xưng là \"bob\".",
